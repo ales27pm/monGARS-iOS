@@ -401,6 +401,9 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
+				INFOPLIST_KEY_NSCalendarsUsageDescription = "monGARS can create calendar events on your behalf.";
+				INFOPLIST_KEY_NSContactsUsageDescription = "monGARS can search your contacts when you ask.";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "monGARS uses your location for weather and nearby places.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "monGARS uses the microphone for voice input to the assistant.";
 				INFOPLIST_KEY_NSRemindersUsageDescription = "monGARS can create reminders on your behalf.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "monGARS uses speech recognition to transcribe your voice input.";
@@ -437,6 +440,9 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
+				INFOPLIST_KEY_NSCalendarsUsageDescription = "monGARS can create calendar events on your behalf.";
+				INFOPLIST_KEY_NSContactsUsageDescription = "monGARS can search your contacts when you ask.";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "monGARS uses your location for weather and nearby places.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "monGARS uses the microphone for voice input to the assistant.";
 				INFOPLIST_KEY_NSRemindersUsageDescription = "monGARS can create reminders on your behalf.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "monGARS uses speech recognition to transcribe your voice input.";
