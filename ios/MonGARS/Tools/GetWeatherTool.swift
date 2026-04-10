@@ -30,10 +30,7 @@ nonisolated final class GetWeatherTool: ToolExecutable, @unchecked Sendable {
             }
         } else {
             do {
-                let location = try await MainActor.run {
-                    Task { try await locationService.requestCurrentLocation() }
-                }
-                let loc = try await location.value
+                let loc = try await requestLocation()
                 coordinate = loc.coordinate
             } catch {
                 return .failure("Could not get current location: \(error.localizedDescription)")
@@ -75,6 +72,11 @@ nonisolated final class GetWeatherTool: ToolExecutable, @unchecked Sendable {
         } catch {
             return .failure("Weather request failed: \(error.localizedDescription)")
         }
+    }
+
+    @MainActor
+    private func requestLocation() async throws -> CLLocation {
+        try await locationService.requestCurrentLocation()
     }
 
     private func weatherDescription(for code: Int) -> String {

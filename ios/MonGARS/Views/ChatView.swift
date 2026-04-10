@@ -20,6 +20,7 @@ struct ChatView: View {
                 text: $viewModel.inputText,
                 isGenerating: viewModel.isGenerating,
                 isListening: viewModel.speechRecognizer.isListening,
+                audioLevel: viewModel.speechRecognizer.audioLevel,
                 onSend: {
                     if viewModel.speechRecognizer.isListening {
                         viewModel.speechRecognizer.stopListening()
@@ -81,6 +82,7 @@ struct ChatView: View {
             .presentationDragIndicator(.visible)
         }
         .sensoryFeedback(.impact(weight: .light), trigger: viewModel.messages.count)
+        .sensoryFeedback(.success, trigger: viewModel.showToolApproval)
         .onAppear {
             viewModel.setModelContext(modelContext)
             viewModel.loadOrCreateConversation(existing: existingConversation)

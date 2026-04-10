@@ -1,23 +1,46 @@
 import Foundation
 import Security
 
+nonisolated enum SecureStoreKey: String, Sendable {
+    case selectedModelVariant = "selected_model_variant"
+    case lastUsedLanguage = "last_used_language"
+    case onboardingCompleted = "onboarding_completed"
+    case modelDownloadToken = "model_download_token"
+}
+
 actor SecureStoreService {
     static let shared = SecureStoreService()
 
     private let serviceName = "com.mongars.securestore"
 
-    func save(key: String, value: String) throws {
+    func save(key: SecureStoreKey, value: String) throws {
+        try save(rawKey: key.rawValue, value: value)
+    }
+
+    func load(key: SecureStoreKey) throws -> String? {
+        try load(rawKey: key.rawValue)
+    }
+
+    func delete(key: SecureStoreKey) throws {
+        try delete(rawKey: key.rawValue)
+    }
+
+    func exists(key: SecureStoreKey) -> Bool {
+        exists(rawKey: key.rawValue)
+    }
+
+    func save(rawKey: String, value: String) throws {
         guard let data = value.data(using: .utf8) else {
             throw SecureStoreError.encodingFailed
         }
-        try save(key: key, data: data)
+        try save(rawKey: rawKey, data: data)
     }
 
-    func save(key: String, data: Data) throws {
+    func save(rawKey: String, data: Data) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: key
+            kSecAttrAccount as String: rawKey
         ]
 
         SecItemDelete(query as CFDictionary)
@@ -32,16 +55,16 @@ actor SecureStoreService {
         }
     }
 
-    func load(key: String) throws -> String? {
-        guard let data = try loadData(key: key) else { return nil }
+    func load(rawKey: String) throws -> String? {
+        guard let data = try loadData(rawKey: rawKey) else { return nil }
         return String(data: data, encoding: .utf8)
     }
 
-    func loadData(key: String) throws -> Data? {
+    func loadData(rawKey: String) throws -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: key,
+            kSecAttrAccount as String: rawKey,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
@@ -56,11 +79,11 @@ actor SecureStoreService {
         return result as? Data
     }
 
-    func delete(key: String) throws {
+    func delete(rawKey: String) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: key
+            kSecAttrAccount as String: rawKey
         ]
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
@@ -68,11 +91,11 @@ actor SecureStoreService {
         }
     }
 
-    func exists(key: String) -> Bool {
+    func exists(rawKey: String) -> Bool {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: key,
+            kSecAttrAccount as String: rawKey,
             kSecReturnData as String: false
         ]
         return SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess

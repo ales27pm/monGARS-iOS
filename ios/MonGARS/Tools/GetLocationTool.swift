@@ -17,19 +17,8 @@ nonisolated final class GetLocationTool: ToolExecutable, @unchecked Sendable {
 
     func execute(arguments: [String: String]) async -> ToolCallResult {
         do {
-            let location = try await MainActor.run {
-                Task {
-                    try await locationService.requestCurrentLocation()
-                }
-            }
-            let loc = try await location.value
-
-            let placemark = try await MainActor.run {
-                Task {
-                    try await locationService.reverseGeocode(location: loc)
-                }
-            }
-            let place = try? await placemark.value
+            let loc = try await requestLocation()
+            let place = try? await reverseGeocode(loc)
 
             var result = "Latitude: \(loc.coordinate.latitude), Longitude: \(loc.coordinate.longitude)"
             if let place {
@@ -48,5 +37,15 @@ nonisolated final class GetLocationTool: ToolExecutable, @unchecked Sendable {
         } catch {
             return .failure("Failed to get location: \(error.localizedDescription)")
         }
+    }
+
+    @MainActor
+    private func requestLocation() async throws -> CLLocation {
+        try await locationService.requestCurrentLocation()
+    }
+
+    @MainActor
+    private func reverseGeocode(_ location: CLLocation) async throws -> CLPlacemark? {
+        try await locationService.reverseGeocode(location: location)
     }
 }

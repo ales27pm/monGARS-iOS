@@ -44,22 +44,17 @@ final class ModelRuntimeCoordinator {
 
         runtimeState = .loadingLLM
 
-        let modelDir = modelDownloadManager.modelDirectory(for: variant)
-        let tokenizerDir = modelDownloadManager.modelDirectory(for: variant)
-            .deletingLastPathComponent()
-            .appendingPathComponent(variant.tokenizerFolderName, isDirectory: true)
-
-        let tokenizerFallback = modelDir
-
-        let actualTokenizerDir: URL
-        if FileManager.default.fileExists(atPath: tokenizerDir.path) {
-            actualTokenizerDir = tokenizerDir
-        } else {
-            actualTokenizerDir = tokenizerFallback
+        guard let modelURL = modelDownloadManager.modelFileURL(for: variant) else {
+            runtimeState = .error("Model files not found on disk")
+            llmReady = false
+            return
         }
 
+        let tokenizerDir = modelDownloadManager.tokenizerDirectory(for: variant)
+            ?? modelDownloadManager.modelDirectory(for: variant)
+
         do {
-            try await llmEngine.loadModel(variant: variant, modelURL: resolveModelURL(modelDir, variant: variant), tokenizerDirectory: actualTokenizerDir)
+            try await llmEngine.loadModel(variant: variant, modelURL: modelURL, tokenizerDirectory: tokenizerDir)
             await llmEngine.warmup()
             llmReady = await llmEngine.isReady
             updateRuntimeState()
@@ -75,24 +70,16 @@ final class ModelRuntimeCoordinator {
 
         runtimeState = .loadingEmbedding
 
-        let modelDir = modelDownloadManager.modelDirectory(for: .graniteEmbedding)
-        let modelURL = resolveModelURL(modelDir, variant: .graniteEmbedding)
-
-        let tokenizerDir = modelDownloadManager.modelDirectory(for: .graniteEmbedding)
-            .deletingLastPathComponent()
-            .appendingPathComponent(ModelVariant.graniteEmbedding.tokenizerFolderName, isDirectory: true)
-
-        let actualTokenizerDir: URL?
-        if FileManager.default.fileExists(atPath: tokenizerDir.path) {
-            actualTokenizerDir = tokenizerDir
-        } else if FileManager.default.fileExists(atPath: modelDir.appendingPathComponent("tokenizer.json").path) {
-            actualTokenizerDir = modelDir
-        } else {
-            actualTokenizerDir = nil
+        guard let modelURL = modelDownloadManager.modelFileURL(for: .graniteEmbedding) else {
+            embeddingReady = false
+            updateRuntimeState()
+            return
         }
 
+        let tokenizerDir = modelDownloadManager.tokenizerDirectory(for: .graniteEmbedding)
+
         do {
-            try await embeddingEngine.loadModel(modelURL: modelURL, tokenizerDirectory: actualTokenizerDir)
+            try await embeddingEngine.loadModel(modelURL: modelURL, tokenizerDirectory: tokenizerDir)
             embeddingReady = await embeddingEngine.isReady
             updateRuntimeState()
         } catch {
@@ -124,11 +111,6 @@ final class ModelRuntimeCoordinator {
 
         logger.info("Attempting fallback to 1B model")
 
-        guard modelDownloadManager.llmState.isDownloaded || true else {
-            runtimeState = .error("Fallback model not downloaded")
-            return
-        }
-
         let fallbackDir = modelDownloadManager.modelDirectory(for: .llama1B)
         guard FileManager.default.fileExists(atPath: fallbackDir.path) else {
             runtimeState = .error("Fallback model not available on disk")
@@ -138,8 +120,11 @@ final class ModelRuntimeCoordinator {
         await llmEngine.unloadModel()
 
         do {
-            let modelURL = resolveModelURL(fallbackDir, variant: .llama1B)
-            let tokenizerDir = fallbackDir
+            guard let modelURL = modelDownloadManager.modelFileURL(for: .llama1B) else {
+                runtimeState = .error("Fallback model files missing")
+                return
+            }
+            let tokenizerDir = modelDownloadManager.tokenizerDirectory(for: .llama1B) ?? fallbackDir
             try await llmEngine.loadModel(variant: .llama1B, modelURL: modelURL, tokenizerDirectory: tokenizerDir)
             await llmEngine.warmup()
             llmReady = await llmEngine.isReady
@@ -152,27 +137,6 @@ final class ModelRuntimeCoordinator {
 
     var isFullyOperational: Bool {
         llmReady
-    }
-
-    // MARK: - Private
-
-    private func resolveModelURL(_ directory: URL, variant: ModelVariant) -> URL {
-        let mlmodelc = directory.appendingPathComponent(variant.modelFileName)
-        if FileManager.default.fileExists(atPath: mlmodelc.path) {
-            return mlmodelc
-        }
-
-        let mlpackage = directory.appendingPathComponent("\(variant.rawValue).mlpackage")
-        if FileManager.default.fileExists(atPath: mlpackage.path) {
-            return mlpackage
-        }
-
-        let mlmodel = directory.appendingPathComponent("\(variant.rawValue).mlmodel")
-        if FileManager.default.fileExists(atPath: mlmodel.path) {
-            return mlmodel
-        }
-
-        return mlmodelc
     }
 
     private func updateRuntimeState() {

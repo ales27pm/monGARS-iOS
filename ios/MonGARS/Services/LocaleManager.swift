@@ -6,6 +6,9 @@ final class LocaleManager {
     var currentLanguage: AppLanguage {
         didSet {
             UserDefaults.standard.set(currentLanguage.rawValue, forKey: "app_language")
+            Task {
+                try? await SecureStoreService.shared.save(key: .lastUsedLanguage, value: currentLanguage.rawValue)
+            }
         }
     }
 
