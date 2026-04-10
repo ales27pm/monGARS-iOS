@@ -11,12 +11,20 @@ struct ContentView: View {
     @State private var selectedTab: AppTab = .conversations
     @State private var selectedConversation: Conversation?
     @State private var showNewChat = false
+    @State private var runtimeCoordinator: ModelRuntimeCoordinator?
 
     var body: some View {
         if !hasCompletedOnboarding {
             onboardingFlow
         } else {
             mainApp
+                .task {
+                    if runtimeCoordinator == nil {
+                        let coordinator = ModelRuntimeCoordinator(modelDownloadManager: modelDownloadManager)
+                        runtimeCoordinator = coordinator
+                        await coordinator.loadAllAvailable()
+                    }
+                }
         }
     }
 
@@ -72,24 +80,28 @@ struct ContentView: View {
         }
     }
 
+    @ViewBuilder
     private var chatDestination: some View {
-        let llmEngine = LLMEngine()
-        let agent = AgentOrchestrator(
-            llmEngine: llmEngine,
-            toolRegistry: toolRegistry,
-            localeManager: localeManager
-        )
+        if let coordinator = runtimeCoordinator {
+            let agent = AgentOrchestrator(
+                llmEngine: coordinator.llmEngine,
+                toolRegistry: toolRegistry,
+                localeManager: localeManager
+            )
 
-        return ChatView(
-            viewModel: ChatViewModel(
-                agent: agent,
-                localeManager: localeManager,
-                speechRecognizer: SpeechRecognizer(),
-                ttsService: TextToSpeechService(),
-                modelDownloadManager: modelDownloadManager
-            ),
-            existingConversation: selectedConversation
-        )
+            ChatView(
+                viewModel: ChatViewModel(
+                    agent: agent,
+                    localeManager: localeManager,
+                    speechRecognizer: SpeechRecognizer(),
+                    ttsService: TextToSpeechService(),
+                    runtimeCoordinator: coordinator
+                ),
+                existingConversation: selectedConversation
+            )
+        } else {
+            ProgressView()
+        }
     }
 }
 

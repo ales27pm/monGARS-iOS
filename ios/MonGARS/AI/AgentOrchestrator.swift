@@ -39,7 +39,7 @@ final class AgentOrchestrator {
         return prompt
     }
 
-    func generateResponse(messages: [Message], language: AppLanguage) -> AsyncThrowingStream<String, Error> {
+    func generateResponse(messages: [Message], language: AppLanguage, config: GenerationConfig = .default) -> AsyncThrowingStream<String, Error> {
         let prompt = compilePrompt(messages: messages, language: language)
 
         return AsyncThrowingStream { continuation in
@@ -55,8 +55,7 @@ final class AgentOrchestrator {
 
                 let stream = await llmEngine.generate(
                     prompt: prompt,
-                    maxTokens: 512,
-                    temperature: 0.7
+                    config: config
                 )
 
                 var fullResponse = ""

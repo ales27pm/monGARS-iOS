@@ -7,17 +7,9 @@ struct MonGARSApp: App {
     @State private var modelDownloadManager = ModelDownloadManager()
     @State private var permissionsManager = PermissionsManager()
     @State private var toolRegistry = ToolRegistry()
-    @State private var llmEngine = LLMEngine()
     @State private var speechRecognizer = SpeechRecognizer()
     @State private var ttsService = TextToSpeechService()
-
-    private var agent: AgentOrchestrator {
-        AgentOrchestrator(
-            llmEngine: llmEngine,
-            toolRegistry: toolRegistry,
-            localeManager: localeManager
-        )
-    }
+    @State private var runtimeCoordinator: ModelRuntimeCoordinator?
 
     var body: some Scene {
         WindowGroup {
@@ -26,6 +18,13 @@ struct MonGARSApp: App {
                 .environment(modelDownloadManager)
                 .environment(permissionsManager)
                 .environment(toolRegistry)
+                .task {
+                    if runtimeCoordinator == nil {
+                        let coordinator = ModelRuntimeCoordinator(modelDownloadManager: modelDownloadManager)
+                        runtimeCoordinator = coordinator
+                        await coordinator.loadAllAvailable()
+                    }
+                }
         }
         .modelContainer(for: [Conversation.self, Message.self])
     }

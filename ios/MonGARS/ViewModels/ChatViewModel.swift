@@ -8,7 +8,7 @@ final class ChatViewModel {
     let localeManager: LocaleManager
     let speechRecognizer: SpeechRecognizer
     let ttsService: TextToSpeechService
-    let modelDownloadManager: ModelDownloadManager
+    let runtimeCoordinator: ModelRuntimeCoordinator
 
     var inputText: String = ""
     var isGenerating: Bool = false
@@ -25,13 +25,13 @@ final class ChatViewModel {
         localeManager: LocaleManager,
         speechRecognizer: SpeechRecognizer,
         ttsService: TextToSpeechService,
-        modelDownloadManager: ModelDownloadManager
+        runtimeCoordinator: ModelRuntimeCoordinator
     ) {
         self.agent = agent
         self.localeManager = localeManager
         self.speechRecognizer = speechRecognizer
         self.ttsService = ttsService
-        self.modelDownloadManager = modelDownloadManager
+        self.runtimeCoordinator = runtimeCoordinator
     }
 
     func setModelContext(_ context: ModelContext) {
@@ -55,7 +55,7 @@ final class ChatViewModel {
     }
 
     var isModelReady: Bool {
-        modelDownloadManager.isLLMReady
+        runtimeCoordinator.llmReady
     }
 
     func sendMessage() {

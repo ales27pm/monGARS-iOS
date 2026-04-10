@@ -1,35 +1,105 @@
+import Accelerate
 import CoreML
 import Foundation
+import os
+
+nonisolated enum EmbeddingEngineState: Sendable, Equatable {
+    case unloaded
+    case loading
+    case ready
+    case error(String)
+}
 
 actor EmbeddingEngine {
+    private let logger = Logger(subsystem: "com.mongars.ai", category: "embedding")
+    private let diagnostics: InferenceDiagnostics
+
     private var model: MLModel?
-    private var isLoaded: Bool = false
+    private var tokenizer: TokenizerService?
+    private var engineState: EmbeddingEngineState = .unloaded
+    private var dimensionCount: Int = 0
 
-    var ready: Bool { isLoaded }
-
-    func loadModel(at url: URL) async throws {
-        let config = MLModelConfiguration()
-        config.computeUnits = .cpuAndNeuralEngine
-
-        let compiledURL: URL
-        if url.pathExtension == "mlmodelc" {
-            compiledURL = url
-        } else {
-            compiledURL = try await MLModel.compileModel(at: url)
-        }
-
-        model = try await MLModel.load(contentsOf: compiledURL, configuration: config)
-        isLoaded = true
+    init(diagnostics: InferenceDiagnostics) {
+        self.diagnostics = diagnostics
     }
 
-    func embed(text: String) async throws -> [Float] {
-        guard let model else {
-            throw EmbeddingError.modelNotLoaded
+    var currentState: EmbeddingEngineState { engineState }
+    var isReady: Bool { engineState == .ready }
+    var dimensions: Int { dimensionCount }
+
+    func loadModel(modelURL: URL, tokenizerDirectory: URL?) async throws {
+        guard engineState != .loading else { return }
+        engineState = .loading
+
+        let loadStart = CFAbsoluteTimeGetCurrent()
+
+        if let tokenizerDirectory {
+            let tokService = TokenizerService()
+            do {
+                try await tokService.load(from: tokenizerDirectory)
+                self.tokenizer = tokService
+            } catch {
+                logger.warning("Embedding tokenizer load failed (will try text input): \(error.localizedDescription)")
+            }
         }
 
-        let inputFeatures = try MLDictionaryFeatureProvider(dictionary: [
-            "text": MLFeatureValue(string: text)
-        ])
+        do {
+            let config = MLModelConfiguration()
+            config.computeUnits = .cpuAndNeuralEngine
+
+            let compiledURL: URL
+            if modelURL.pathExtension == "mlmodelc" {
+                compiledURL = modelURL
+            } else {
+                compiledURL = try await MLModel.compileModel(at: modelURL)
+            }
+
+            let loadedModel = try await MLModel.load(contentsOf: compiledURL, configuration: config)
+            self.model = loadedModel
+
+            if let outputDesc = loadedModel.modelDescription.outputDescriptionsByName["embedding"],
+               let shape = outputDesc.multiArrayConstraint?.shape {
+                dimensionCount = shape.last?.intValue ?? 0
+            }
+
+            engineState = .ready
+
+            let loadDuration = CFAbsoluteTimeGetCurrent() - loadStart
+            await diagnostics.recordModelLoad(variant: .graniteEmbedding, durationSeconds: loadDuration, success: true)
+        } catch {
+            let loadDuration = CFAbsoluteTimeGetCurrent() - loadStart
+            engineState = .error("Embedding model loading failed: \(error.localizedDescription)")
+            await diagnostics.recordModelLoad(variant: .graniteEmbedding, durationSeconds: loadDuration, success: false)
+            throw error
+        }
+    }
+
+    func embed(text: String) async throws -> EmbeddingResult {
+        guard let model else { throw EmbeddingError.modelNotLoaded }
+
+        let start = CFAbsoluteTimeGetCurrent()
+
+        let inputFeatures: MLDictionaryFeatureProvider
+        var inputTokenCount = 0
+
+        if let tokenizer {
+            let tokens = await tokenizer.encode(text)
+            inputTokenCount = tokens.count
+            let maxLen = ModelVariant.graniteEmbedding.contextWindowTokens
+            let truncated = Array(tokens.prefix(maxLen))
+
+            let inputArray = try MLMultiArray(shape: [1, NSNumber(value: truncated.count)], dataType: .int32)
+            for (i, token) in truncated.enumerated() {
+                inputArray[[0, NSNumber(value: i)] as [NSNumber]] = NSNumber(value: token)
+            }
+            inputFeatures = try MLDictionaryFeatureProvider(dictionary: [
+                "input_ids": MLFeatureValue(multiArray: inputArray)
+            ])
+        } else {
+            inputFeatures = try MLDictionaryFeatureProvider(dictionary: [
+                "text": MLFeatureValue(string: text)
+            ])
+        }
 
         let output = try await model.prediction(from: inputFeatures)
 
@@ -40,41 +110,90 @@ actor EmbeddingEngine {
 
         let count = embeddingArray.count
         var vector = [Float](repeating: 0, count: count)
-        for i in 0..<count {
-            vector[i] = embeddingArray[i].floatValue
+
+        if embeddingArray.dataType == .float32 {
+            let ptr = embeddingArray.dataPointer.assumingMemoryBound(to: Float.self)
+            vector.withUnsafeMutableBufferPointer { dest in
+                dest.baseAddress!.initialize(from: ptr, count: count)
+            }
+        } else {
+            for i in 0..<count {
+                vector[i] = embeddingArray[i].floatValue
+            }
         }
 
-        return normalize(vector)
+        let normalized = l2Normalize(vector)
+        let elapsed = CFAbsoluteTimeGetCurrent() - start
+
+        return EmbeddingResult(
+            vector: normalized,
+            dimensions: count,
+            computeTimeSeconds: elapsed,
+            inputTokenCount: inputTokenCount
+        )
+    }
+
+    func embedBatch(texts: [String]) async throws -> [EmbeddingResult] {
+        var results: [EmbeddingResult] = []
+        results.reserveCapacity(texts.count)
+        for text in texts {
+            try Task.checkCancellation()
+            let result = try await embed(text: text)
+            results.append(result)
+        }
+        return results
     }
 
     func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
         guard a.count == b.count, !a.isEmpty else { return 0 }
+
         var dot: Float = 0
         var normA: Float = 0
         var normB: Float = 0
-        for i in 0..<a.count {
-            dot += a[i] * b[i]
-            normA += a[i] * a[i]
-            normB += b[i] * b[i]
-        }
+
+        vDSP_dotpr(a, 1, b, 1, &dot, vDSP_Length(a.count))
+        vDSP_svesq(a, 1, &normA, vDSP_Length(a.count))
+        vDSP_svesq(b, 1, &normB, vDSP_Length(b.count))
+
         let denom = sqrt(normA) * sqrt(normB)
         guard denom > 0 else { return 0 }
         return dot / denom
     }
 
-    func unloadModel() {
-        model = nil
-        isLoaded = false
+    func rankBySimilarity(query: [Float], candidates: [(id: String, vector: [Float])], topK: Int? = nil) -> [(id: String, score: Float)] {
+        var scored = candidates.map { (id: $0.id, score: cosineSimilarity(query, $0.vector)) }
+        scored.sort { $0.score > $1.score }
+        if let topK {
+            return Array(scored.prefix(topK))
+        }
+        return scored
     }
 
-    private func normalize(_ vector: [Float]) -> [Float] {
-        let norm = sqrt(vector.reduce(0) { $0 + $1 * $1 })
+    func unloadModel() {
+        model = nil
+        tokenizer = nil
+        dimensionCount = 0
+        engineState = .unloaded
+        logger.info("Embedding engine unloaded")
+    }
+
+    // MARK: - Private
+
+    private func l2Normalize(_ vector: [Float]) -> [Float] {
+        var sumSq: Float = 0
+        vDSP_svesq(vector, 1, &sumSq, vDSP_Length(vector.count))
+        let norm = sqrt(sumSq)
         guard norm > 0 else { return vector }
-        return vector.map { $0 / norm }
+
+        var result = [Float](repeating: 0, count: vector.count)
+        var divisor = norm
+        vDSP_vsdiv(vector, 1, &divisor, &result, 1, vDSP_Length(vector.count))
+        return result
     }
 }
 
 nonisolated enum EmbeddingError: Error, Sendable {
     case modelNotLoaded
     case invalidOutput
+    case textTooLong
 }
