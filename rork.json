@@ -1,0 +1,10 @@
+{
+  "$schema": "https://rork.com/schema/rork.json",
+  "apps": [
+    {
+      "name": "monGARS",
+      "path": "ios",
+      "framework": "swift"
+    }
+  ]
+}
