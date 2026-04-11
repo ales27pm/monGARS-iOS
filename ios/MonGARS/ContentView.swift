@@ -70,6 +70,18 @@ struct ContentView: View {
                         }
                     }
                 }
+                .onChange(of: modelDownloadManager.selectedChatSourceID) { _, _ in
+                    guard let coordinator = runtimeCoordinator else { return }
+                    Task {
+                        await coordinator.reloadSelectedChatModelRuntime()
+                    }
+                }
+                .onChange(of: modelDownloadManager.selectedEmbeddingSourceID) { _, _ in
+                    guard let coordinator = runtimeCoordinator else { return }
+                    Task {
+                        await coordinator.reloadSelectedEmbeddingModelRuntime()
+                    }
+                }
         }
     }
 
@@ -129,6 +141,7 @@ struct ContentView: View {
     @ViewBuilder
     private var chatDestination: some View {
         if let coordinator = runtimeCoordinator {
+            let selectedChatSourceID = modelDownloadManager.selectedChatSourceID
             let agent = AgentOrchestrator(
                 llmEngine: coordinator.llmEngine,
                 toolRegistry: toolRegistry,
@@ -148,6 +161,7 @@ struct ContentView: View {
                 ),
                 existingConversation: selectedConversation
             )
+            .id(selectedChatSourceID)
         } else {
             ProgressView()
         }

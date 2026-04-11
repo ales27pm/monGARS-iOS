@@ -13,6 +13,12 @@ nonisolated enum RuntimeState: Sendable, Equatable {
 @Observable
 @MainActor
 final class ModelRuntimeCoordinator {
+    nonisolated enum LLMAvailabilityIssue: Sendable, Equatable {
+        case notInstalled
+        case tokenizerMissing
+        case runtimeLoadFailed(String)
+    }
+
     let llmEngine: LLMEngine
     let embeddingEngine: EmbeddingEngine
     let diagnostics: InferenceDiagnostics
@@ -21,6 +27,7 @@ final class ModelRuntimeCoordinator {
     private(set) var runtimeState: RuntimeState = .idle
     private(set) var llmReady: Bool = false
     private(set) var embeddingReady: Bool = false
+    private(set) var lastLLMLoadError: String?
 
     private let logger = Logger(subsystem: "com.mongars.ai", category: "runtime")
     private var memoryPressureSource: DispatchSourceMemoryPressure?
@@ -45,20 +52,24 @@ final class ModelRuntimeCoordinator {
         let llmState = modelDownloadManager.llmState
         guard llmState.isDownloaded || llmState.isInstalledPartially else {
             runtimeState = .degraded("LLM model not downloaded")
+            lastLLMLoadError = nil
             return
         }
 
         guard modelDownloadManager.hasTokenizer(for: sourceID) else {
             runtimeState = .degraded("Tokenizer missing for \(sourceID). Chat model cannot load without tokenizer files.")
             llmReady = false
+            lastLLMLoadError = nil
             return
         }
 
         runtimeState = .loadingLLM
+        lastLLMLoadError = nil
 
         guard let modelURL = modelDownloadManager.modelFileURL(for: sourceID) else {
             runtimeState = .error("Model files not found on disk")
             llmReady = false
+            lastLLMLoadError = "Model files not found on disk"
             return
         }
 
@@ -77,6 +88,7 @@ final class ModelRuntimeCoordinator {
             logger.error("LLM load failed: \(error.localizedDescription)")
             runtimeState = .error("Failed to load language model: \(error.localizedDescription)")
             llmReady = false
+            lastLLMLoadError = error.localizedDescription
         }
     }
 
@@ -109,6 +121,32 @@ final class ModelRuntimeCoordinator {
 
     func loadAllAvailable() async {
         await loadLLMIfAvailable()
+        await loadEmbeddingIfAvailable()
+    }
+
+    func reloadSelectedChatModelRuntime() async {
+        await llmEngine.unloadModel()
+        llmReady = false
+        lastLLMLoadError = nil
+
+        let llmState = modelDownloadManager.llmState
+        guard llmState.isInstalled || llmState.isInstalledPartially else {
+            runtimeState = .degraded("LLM model not downloaded")
+            return
+        }
+
+        await loadLLMIfAvailable()
+    }
+
+    func reloadSelectedEmbeddingModelRuntime() async {
+        await embeddingEngine.unloadModel()
+        embeddingReady = false
+
+        guard modelDownloadManager.embeddingState.isInstalled else {
+            updateRuntimeState()
+            return
+        }
+
         await loadEmbeddingIfAvailable()
     }
 
@@ -159,6 +197,20 @@ final class ModelRuntimeCoordinator {
 
     var isFullyOperational: Bool {
         llmReady
+    }
+
+    var llmAvailabilityIssue: LLMAvailabilityIssue? {
+        let sourceID = modelDownloadManager.selectedChatSourceID
+        if !(modelDownloadManager.llmState.isInstalled || modelDownloadManager.llmState.isInstalledPartially) {
+            return .notInstalled
+        }
+        if !modelDownloadManager.hasTokenizer(for: sourceID) {
+            return .tokenizerMissing
+        }
+        if !llmReady {
+            return .runtimeLoadFailed(lastLLMLoadError ?? "Unknown runtime loading error")
+        }
+        return nil
     }
 
     private func updateRuntimeState() {

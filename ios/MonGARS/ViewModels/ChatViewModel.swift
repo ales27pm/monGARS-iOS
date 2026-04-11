@@ -139,11 +139,32 @@ final class ChatViewModel {
 
     private func generateResponse() {
         guard isModelReady else {
+            let unavailableMessage: String
+            switch runtimeCoordinator.llmAvailabilityIssue {
+            case .notInstalled:
+                unavailableMessage = localeManager.localizedString(
+                    "The AI model is not installed yet. Please go to Settings to download it.",
+                    "Le modèle IA n'est pas encore installé. Veuillez aller dans les Réglages pour le télécharger."
+                )
+            case .tokenizerMissing:
+                unavailableMessage = localeManager.localizedString(
+                    "The selected AI model is installed, but tokenizer files are missing. Reinstall the model from Settings.",
+                    "Le modèle IA sélectionné est installé, mais les fichiers tokenizer sont manquants. Réinstallez le modèle depuis les Réglages."
+                )
+            case .runtimeLoadFailed(let details):
+                unavailableMessage = localeManager.localizedString(
+                    "The selected AI model is installed, but failed to load at runtime. Please retry loading from Settings. Error: \(details)",
+                    "Le modèle IA sélectionné est installé, mais son chargement d'exécution a échoué. Veuillez réessayer depuis les Réglages. Erreur : \(details)"
+                )
+            case .none:
+                unavailableMessage = localeManager.localizedString(
+                    "The AI model is currently unavailable. Please verify model settings.",
+                    "Le modèle IA est actuellement indisponible. Veuillez vérifier les réglages du modèle."
+                )
+            }
+
             let placeholder = Message(
-                content: localeManager.localizedString(
-                    "The AI model needs to be downloaded before I can respond. Please go to Settings to download the model.",
-                    "Le mod\u{00E8}le IA doit \u{00EA}tre t\u{00E9}l\u{00E9}charg\u{00E9} avant que je puisse r\u{00E9}pondre. Veuillez aller dans les R\u{00E9}glages pour t\u{00E9}l\u{00E9}charger le mod\u{00E8}le."
-                ),
+                content: unavailableMessage,
                 role: .assistant,
                 language: localeManager.currentLanguage
             )
