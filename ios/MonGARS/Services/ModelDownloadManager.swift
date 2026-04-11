@@ -3,10 +3,21 @@ import ZIPFoundation
 import os
 
 nonisolated enum InstallPhase: String, Sendable {
+    case preflight
     case downloading
     case extracting
     case validating
     case installingTokenizer
+    case complete
+}
+
+nonisolated enum OverallInstallPhase: String, Sendable {
+    case llmDownload
+    case llmInstall
+    case embeddingDownload
+    case embeddingInstall
+    case tokenizerInstall
+    case validation
     case complete
 }
 
@@ -17,6 +28,8 @@ final class ModelDownloadManager {
     var embeddingState: ModelDownloadState = .notDownloaded
     var selectedLLMVariant: ModelVariant = .llama1B
     var currentInstallPhase: InstallPhase?
+    var overallPhase: OverallInstallPhase?
+    var lastDiagnosticMessage: String?
 
     private var activeTasks: [ModelVariant: URLSessionDownloadTask] = [:]
     private var progressObservations: [ModelVariant: NSKeyValueObservation] = [:]
@@ -29,7 +42,9 @@ final class ModelDownloadManager {
 
     var isLLMReady: Bool { llmState.isInstalled }
     var isEmbeddingReady: Bool { embeddingState.isInstalled }
-    var isFullyReady: Bool { isLLMReady }
+    var isFullyReady: Bool { isLLMReady && isEmbeddingReady }
+    var isChatReady: Bool { isLLMReady }
+    var isSemanticMemoryReady: Bool { isEmbeddingReady }
 
     var llmStorageUsed: String {
         guard isLLMReady else { return "0 MB" }
@@ -42,60 +57,44 @@ final class ModelDownloadManager {
     }
 
     func startDownload(variant: ModelVariant) {
-        guard let url = archiveDownloadURL(for: variant) else {
-            updateState(for: variant, state: .error("Invalid download URL"))
+        guard ModelManifest.isAvailableForDownload(variant) else {
+            let entry = ModelManifest.entry(for: variant)
+            let reason = entry?.notes ?? "No download URL configured"
+            updateState(for: variant, state: .unavailable(reason))
+            logger.warning("Download not available for \(variant.rawValue): \(reason)")
+            return
+        }
+
+        guard let url = ModelManifest.archiveURL(for: variant) else {
+            updateState(for: variant, state: .error(DownloadDiagnosticError.noArchiveURL(variant: variant.rawValue).userMessage))
             return
         }
 
         guard hasSufficientSpace(for: variant) else {
-            updateState(for: variant, state: .error("Insufficient disk space"))
+            updateState(for: variant, state: .error("Insufficient disk space. Need \(variant.estimatedSizeDescription) free."))
             return
         }
 
         updateState(for: variant, state: .downloading(progress: 0))
-        currentInstallPhase = .downloading
+        currentInstallPhase = .preflight
 
-        let task = URLSession.shared.downloadTask(with: url) { [weak self] tempURL, response, error in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.progressObservations.removeValue(forKey: variant)
-                self.activeTasks.removeValue(forKey: variant)
+        Task {
+            let preflightResult = await preflightCheck(url: url, variant: variant)
+            guard preflightResult else { return }
 
-                if let error {
-                    if (error as NSError).code == NSURLErrorCancelled {
-                        self.updateState(for: variant, state: .notDownloaded)
-                    } else {
-                        self.updateState(for: variant, state: .error(error.localizedDescription))
-                    }
-                    self.currentInstallPhase = nil
-                    return
-                }
-
-                guard let tempURL else {
-                    self.updateState(for: variant, state: .error("Download failed: no file received"))
-                    self.currentInstallPhase = nil
-                    return
-                }
-
-                guard let response = response as? HTTPURLResponse, (200...299).contains(response.statusCode) else {
-                    self.updateState(for: variant, state: .error("Server returned an error"))
-                    self.currentInstallPhase = nil
-                    return
-                }
-
-                self.updateState(for: variant, state: .installing)
-                await self.installModel(archiveURL: tempURL, variant: variant)
-            }
+            currentInstallPhase = .downloading
+            beginDownloadTask(url: url, variant: variant)
         }
+    }
 
-        let observation = task.progress.observe(\.fractionCompleted, options: [.new]) { [weak self] progress, _ in
-            Task { @MainActor [weak self] in
-                self?.updateState(for: variant, state: .downloading(progress: progress.fractionCompleted))
-            }
-        }
-        progressObservations[variant] = observation
-        activeTasks[variant] = task
-        task.resume()
+    func startFullInstall() {
+        overallPhase = .llmDownload
+        startDownload(variant: selectedLLMVariant)
+    }
+
+    func startEmbeddingDownload() {
+        overallPhase = .embeddingDownload
+        startDownload(variant: .graniteEmbedding)
     }
 
     func cancelDownload(variant: ModelVariant) {
@@ -103,6 +102,7 @@ final class ModelDownloadManager {
         activeTasks.removeValue(forKey: variant)
         progressObservations.removeValue(forKey: variant)
         currentInstallPhase = nil
+        overallPhase = nil
         updateState(for: variant, state: .notDownloaded)
     }
 
@@ -182,6 +182,121 @@ final class ModelDownloadManager {
         return availableDiskSpaceBytes > (required + buffer)
     }
 
+    private func preflightCheck(url: URL, variant: ModelVariant) async -> Bool {
+        logger.info("Preflight: checking \(url.absoluteString)")
+        lastDiagnosticMessage = "Preflight: \(url.absoluteString)"
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 15
+
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                updateState(for: variant, state: .error("Preflight: non-HTTP response"))
+                return false
+            }
+
+            let finalURL = http.url ?? url
+            logger.info("Preflight resolved URL: \(finalURL.absoluteString), status: \(http.statusCode)")
+
+            if (200...399).contains(http.statusCode) {
+                return true
+            }
+
+            let diagError = classifyHTTPError(statusCode: http.statusCode, url: finalURL.absoluteString, bodyPreview: "")
+            let msg = diagError.userMessage
+            updateState(for: variant, state: .error(msg))
+            lastDiagnosticMessage = msg
+            logger.error("Preflight failed: \(msg)")
+            return false
+        } catch {
+            let msg = DownloadDiagnosticError.preflightUnreachable(url: url.absoluteString, underlyingError: error.localizedDescription).userMessage
+            updateState(for: variant, state: .error(msg))
+            lastDiagnosticMessage = msg
+            logger.error("Preflight error: \(msg)")
+            return false
+        }
+    }
+
+    private func beginDownloadTask(url: URL, variant: ModelVariant) {
+        logger.info("Starting download: \(url.absoluteString) for \(variant.rawValue)")
+
+        let task = URLSession.shared.downloadTask(with: url) { [weak self] tempURL, response, error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.progressObservations.removeValue(forKey: variant)
+                self.activeTasks.removeValue(forKey: variant)
+
+                if let error {
+                    if (error as NSError).code == NSURLErrorCancelled {
+                        self.updateState(for: variant, state: .notDownloaded)
+                    } else {
+                        self.updateState(for: variant, state: .error("Download error: \(error.localizedDescription)"))
+                    }
+                    self.currentInstallPhase = nil
+                    return
+                }
+
+                guard let tempURL else {
+                    self.updateState(for: variant, state: .error("Download failed: no file received"))
+                    self.currentInstallPhase = nil
+                    return
+                }
+
+                if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                    let bodyPreview = self.readBodyPreview(from: tempURL)
+                    let finalURL = http.url?.absoluteString ?? url.absoluteString
+                    let diagError = self.classifyHTTPError(statusCode: http.statusCode, url: finalURL, bodyPreview: bodyPreview)
+                    let msg = diagError.userMessage
+                    self.updateState(for: variant, state: .error(msg))
+                    self.lastDiagnosticMessage = msg
+                    self.logger.error("Download HTTP error: \(msg)")
+                    self.currentInstallPhase = nil
+                    try? self.fileManager.removeItem(at: tempURL)
+                    return
+                }
+
+                if let http = response as? HTTPURLResponse {
+                    let finalURL = http.url?.absoluteString ?? url.absoluteString
+                    self.logger.info("Download complete. Final URL: \(finalURL), status: \(http.statusCode)")
+                }
+
+                self.updateState(for: variant, state: .installing)
+                await self.installModel(archiveURL: tempURL, variant: variant)
+            }
+        }
+
+        let observation = task.progress.observe(\.fractionCompleted, options: [.new]) { [weak self] progress, _ in
+            Task { @MainActor [weak self] in
+                self?.updateState(for: variant, state: .downloading(progress: progress.fractionCompleted))
+            }
+        }
+        progressObservations[variant] = observation
+        activeTasks[variant] = task
+        task.resume()
+    }
+
+    private func classifyHTTPError(statusCode: Int, url: String, bodyPreview: String) -> DownloadDiagnosticError {
+        switch statusCode {
+        case 401, 403:
+            .accessDenied(url: url, statusCode: statusCode)
+        case 404:
+            .notFound(url: url)
+        case 429:
+            .rateLimited(url: url)
+        case 500...599:
+            .serverError(url: url, statusCode: statusCode)
+        default:
+            .unexpectedStatus(url: url, statusCode: statusCode, bodyPreview: String(bodyPreview.prefix(200)))
+        }
+    }
+
+    private func readBodyPreview(from fileURL: URL) -> String {
+        guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else { return "" }
+        return String(data: data.prefix(500), encoding: .utf8) ?? ""
+    }
+
     private func installModel(archiveURL: URL, variant: ModelVariant) async {
         let stagingDir = modelsBaseDirectory().appendingPathComponent("staging-\(variant.rawValue)", isDirectory: true)
 
@@ -189,10 +304,16 @@ final class ModelDownloadManager {
             try cleanAndCreateDirectory(at: stagingDir)
 
             currentInstallPhase = .extracting
+            if variant.isLanguageModel {
+                overallPhase = .llmInstall
+            } else {
+                overallPhase = .embeddingInstall
+            }
             logger.info("Extracting archive for \(variant.rawValue)...")
             try extractArchive(at: archiveURL, to: stagingDir)
 
             currentInstallPhase = .validating
+            overallPhase = .validation
             let modelArtifactURL = try locateModelArtifact(in: stagingDir, variant: variant)
             logger.info("Found model artifact: \(modelArtifactURL.lastPathComponent)")
 
@@ -203,6 +324,7 @@ final class ModelDownloadManager {
             try fileManager.moveItem(at: modelArtifactURL, to: destModelURL)
 
             currentInstallPhase = .installingTokenizer
+            overallPhase = .tokenizerInstall
             await downloadTokenizerFiles(variant: variant, to: destDir)
 
             try validateInstall(modelDir: destDir, variant: variant)
@@ -274,12 +396,13 @@ final class ModelDownloadManager {
             let destFile = directory.appendingPathComponent(fileName)
             if fileManager.fileExists(atPath: destFile.path) { continue }
 
-            guard let url = tokenizerFileURL(for: variant, fileName: fileName) else { continue }
+            guard let url = ModelManifest.tokenizerFileURL(for: variant, fileName: fileName) else { continue }
 
             do {
                 let (data, response) = try await URLSession.shared.data(from: url)
                 guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
-                    logger.warning("Tokenizer file \(fileName) not available (HTTP error)")
+                    let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    logger.warning("Tokenizer file \(fileName) not available (HTTP \(code))")
                     continue
                 }
                 try data.write(to: destFile, options: .atomic)
@@ -318,6 +441,23 @@ final class ModelDownloadManager {
 
     private func checkExistingModels() {
         for variant in ModelVariant.allCases {
+            if !ModelManifest.isAvailableForDownload(variant) {
+                let dir = modelDirectory(for: variant)
+                if fileManager.fileExists(atPath: dir.path) {
+                    do {
+                        try validateInstall(modelDir: dir, variant: variant)
+                        updateState(for: variant, state: .installed)
+                        continue
+                    } catch {
+                        // fall through
+                    }
+                }
+                let entry = ModelManifest.entry(for: variant)
+                let reason = entry?.notes ?? "No download available"
+                updateState(for: variant, state: .unavailable(reason))
+                continue
+            }
+
             let dir = modelDirectory(for: variant)
             guard fileManager.fileExists(atPath: dir.path) else { continue }
 
@@ -337,14 +477,6 @@ final class ModelDownloadManager {
         } else if variant.isEmbeddingModel {
             embeddingState = state
         }
-    }
-
-    private func archiveDownloadURL(for variant: ModelVariant) -> URL? {
-        URL(string: "https://huggingface.co/\(variant.huggingFaceRepo)/resolve/main/\(variant.archiveFileName)")
-    }
-
-    private func tokenizerFileURL(for variant: ModelVariant, fileName: String) -> URL? {
-        URL(string: "https://huggingface.co/\(variant.huggingFaceRepo)/resolve/main/\(fileName)")
     }
 
     private func cleanAndCreateDirectory(at url: URL) throws {

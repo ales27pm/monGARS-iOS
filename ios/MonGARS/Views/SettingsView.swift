@@ -7,6 +7,7 @@ struct SettingsView: View {
         Form {
             languageSection
             modelSection
+            embeddingSection
             networkSection
             voiceSection
             privacySection
@@ -46,7 +47,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading) {
                     Text(viewModel.modelDownloadManager.selectedLLMVariant.displayName)
                         .font(.body)
-                    Text(viewModel.localeManager.localizedString("Language Model", "Mod\u{00E8}le de langue"))
+                    Text(viewModel.localeManager.localizedString("Language Model — Conversation", "Mod\u{00E8}le de langue — Conversation"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -100,6 +101,53 @@ struct SettingsView: View {
                 "This will remove the AI model from your device. You'll need to download it again to use the assistant.",
                 "Cela supprimera le mod\u{00E8}le IA de ton appareil. Tu devras le ret\u{00E9}l\u{00E9}charger pour utiliser l'assistant."
             ))
+        }
+    }
+
+    private var embeddingSection: some View {
+        Section {
+            HStack {
+                VStack(alignment: .leading) {
+                    Text(ModelVariant.graniteEmbedding.displayName)
+                        .font(.body)
+                    Text(viewModel.localeManager.localizedString("Semantic Memory / Recall", "M\u{00E9}moire s\u{00E9}mantique / Rappel"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                modelStatusBadge(viewModel.modelDownloadManager.embeddingState)
+            }
+
+            if viewModel.modelDownloadManager.isEmbeddingReady {
+                HStack {
+                    Text(viewModel.localeManager.localizedString("Storage Used", "Espace utilis\u{00E9}"))
+                    Spacer()
+                    Text(viewModel.modelDownloadManager.embeddingStorageUsed)
+                        .foregroundStyle(.secondary)
+                }
+
+                Button(role: .destructive) {
+                    viewModel.modelDownloadManager.deleteModel(variant: .graniteEmbedding)
+                } label: {
+                    Label(
+                        viewModel.localeManager.localizedString("Delete Embedding Model", "Supprimer le mod\u{00E8}le d'embeddings"),
+                        systemImage: "trash"
+                    )
+                }
+            } else if viewModel.modelDownloadManager.embeddingState.isUnavailable {
+                HStack(spacing: 6) {
+                    Image(systemName: "info.circle")
+                        .foregroundStyle(.secondary)
+                    Text(viewModel.localeManager.localizedString(
+                        "Requires a CoreML-converted embedding model. Chat works without it.",
+                        "N\u{00E9}cessite un mod\u{00E8}le d'embeddings converti en CoreML. Le clavardage fonctionne sans."
+                    ))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+        } header: {
+            Text(viewModel.localeManager.localizedString("Embedding Model", "Mod\u{00E8}le d'embeddings"))
         }
     }
 
@@ -255,6 +303,13 @@ struct SettingsView: View {
             Text(viewModel.localeManager.localizedString("Not Downloaded", "Non t\u{00E9}l\u{00E9}charg\u{00E9}"))
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        case .unavailable:
+            Text(viewModel.localeManager.localizedString("Unavailable", "Indisponible"))
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .background(.orange.opacity(0.15), in: Capsule())
         case .error:
             Image(systemName: "exclamationmark.triangle")
                 .foregroundStyle(.red)

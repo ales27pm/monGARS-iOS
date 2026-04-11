@@ -14,42 +14,72 @@ final class OnboardingViewModel {
     }
 
     var hasCompletedOnboarding: Bool {
-        get {
-            let exists = SecureStoreService.syncExists(key: .onboardingCompleted)
-            if exists { return true }
-            return UserDefaults.standard.bool(forKey: "has_completed_onboarding")
-        }
+        SecureStoreService.syncExists(key: .onboardingCompleted)
     }
 
-    var isDownloading: Bool {
+    var isLLMDownloading: Bool {
         modelDownloadManager.llmState.isDownloading
     }
 
-    var isInstalling: Bool {
+    var isLLMInstalling: Bool {
         modelDownloadManager.llmState.isInstalling
     }
 
-    var isModelReady: Bool {
+    var isLLMReady: Bool {
         modelDownloadManager.isLLMReady
     }
 
-    var downloadProgress: Double {
+    var isEmbeddingDownloading: Bool {
+        modelDownloadManager.embeddingState.isDownloading
+    }
+
+    var isEmbeddingInstalling: Bool {
+        modelDownloadManager.embeddingState.isInstalling
+    }
+
+    var isEmbeddingReady: Bool {
+        modelDownloadManager.isEmbeddingReady
+    }
+
+    var isEmbeddingUnavailable: Bool {
+        modelDownloadManager.embeddingState.isUnavailable
+    }
+
+    var isAnyDownloadActive: Bool {
+        isLLMDownloading || isLLMInstalling || isEmbeddingDownloading || isEmbeddingInstalling
+    }
+
+    var isChatReady: Bool {
+        modelDownloadManager.isChatReady
+    }
+
+    var llmProgress: Double {
         if case .downloading(let progress) = modelDownloadManager.llmState {
             return progress
         }
         return 0
     }
 
-    var downloadErrorMessage: String? {
-        if case .error(let msg) = modelDownloadManager.llmState {
-            return msg
+    var embeddingProgress: Double {
+        if case .downloading(let progress) = modelDownloadManager.embeddingState {
+            return progress
         }
-        return nil
+        return 0
+    }
+
+    var llmErrorMessage: String? {
+        modelDownloadManager.llmState.errorMessage
+    }
+
+    var embeddingErrorMessage: String? {
+        modelDownloadManager.embeddingState.errorMessage
     }
 
     var installPhaseDescription: String? {
         guard let phase = modelDownloadManager.currentInstallPhase else { return nil }
         switch phase {
+        case .preflight:
+            return localeManager.localizedString("Checking model host...", "Vérification de l'hôte...")
         case .downloading:
             return localeManager.localizedString("Downloading...", "Téléchargement...")
         case .extracting:
@@ -63,12 +93,37 @@ final class OnboardingViewModel {
         }
     }
 
+    var overallPhaseDescription: String? {
+        guard let phase = modelDownloadManager.overallPhase else { return nil }
+        switch phase {
+        case .llmDownload:
+            return localeManager.localizedString("Downloading language model...", "Téléchargement du modèle de langue...")
+        case .llmInstall:
+            return localeManager.localizedString("Installing language model...", "Installation du modèle de langue...")
+        case .embeddingDownload:
+            return localeManager.localizedString("Downloading embedding model...", "Téléchargement du modèle d'embeddings...")
+        case .embeddingInstall:
+            return localeManager.localizedString("Installing embedding model...", "Installation du modèle d'embeddings...")
+        case .tokenizerInstall:
+            return localeManager.localizedString("Installing tokenizer...", "Installation du tokenizer...")
+        case .validation:
+            return localeManager.localizedString("Validating...", "Validation...")
+        case .complete:
+            return localeManager.localizedString("Complete", "Terminé")
+        }
+    }
+
     func startDownload() {
         modelDownloadManager.startDownload(variant: modelDownloadManager.selectedLLMVariant)
     }
 
+    func startEmbeddingDownload() {
+        modelDownloadManager.startDownload(variant: .graniteEmbedding)
+    }
+
     func cancelDownload() {
         modelDownloadManager.cancelDownload(variant: modelDownloadManager.selectedLLMVariant)
+        modelDownloadManager.cancelDownload(variant: .graniteEmbedding)
     }
 
     func advanceStep() {
@@ -94,7 +149,6 @@ final class OnboardingViewModel {
         Task {
             try? await SecureStoreService.shared.save(key: .onboardingCompleted, value: "true")
         }
-        UserDefaults.standard.set(true, forKey: "has_completed_onboarding")
     }
 }
 

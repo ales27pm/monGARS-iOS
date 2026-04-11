@@ -19,6 +19,14 @@ struct ContentView: View {
         SecureStoreService.syncExists(key: .onboardingCompleted)
     }
 
+    private var isChatReady: Bool {
+        modelDownloadManager.isChatReady
+    }
+
+    private var isSemanticMemoryReady: Bool {
+        modelDownloadManager.isSemanticMemoryReady
+    }
+
     var body: some View {
         if !hasCompletedOnboarding {
             onboardingFlow
