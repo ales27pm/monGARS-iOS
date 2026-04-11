@@ -47,6 +47,7 @@ final class SettingsViewModel {
         get { modelDownloadManager.selectedChatSourceID }
         set {
             modelDownloadManager.selectedChatSourceID = newValue
+            modelDownloadManager.refreshSelectedStates()
             Task {
                 try? await SecureStoreService.shared.save(key: .selectedModelVariant, value: newValue)
             }
@@ -57,6 +58,7 @@ final class SettingsViewModel {
         get { modelDownloadManager.selectedEmbeddingSourceID }
         set {
             modelDownloadManager.selectedEmbeddingSourceID = newValue
+            modelDownloadManager.refreshSelectedStates()
             Task {
                 try? await SecureStoreService.shared.save(key: .selectedEmbeddingSource, value: newValue)
             }

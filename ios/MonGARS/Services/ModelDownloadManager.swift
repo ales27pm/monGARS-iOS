@@ -731,36 +731,48 @@ final class ModelDownloadManager {
     // MARK: - State Management
 
     private func checkExistingModels() {
-        for source in ModelSourceCatalog.allSources {
-            if !source.isAvailableForDownload {
-                let dir = modelDirectory(for: source.id)
-                if fileManager.fileExists(atPath: dir.path) {
-                    do {
-                        try validateInstall(modelDir: dir, source: source)
-                        let hasTok = hasTokenizer(for: source.id)
-                        updateState(for: source.id, state: hasTok ? .installed : .installedMissingTokenizer)
-                        continue
-                    } catch {
-                        // fall through
-                    }
-                }
-                if case .unsupported(let reason) = source.downloadStrategy {
-                    updateState(for: source.id, state: .unavailable(reason))
-                }
-                continue
-            }
+        refreshSelectedStates()
+    }
 
+    func refreshSelectedStates() {
+        refreshStateForSource(selectedChatSourceID)
+        refreshStateForSource(selectedEmbeddingSourceID)
+    }
+
+    private func refreshStateForSource(_ sourceID: ModelSourceID) {
+        guard let source = ModelSourceCatalog.source(for: sourceID) else { return }
+
+        if !source.isAvailableForDownload {
             let dir = modelDirectory(for: source.id)
-            guard fileManager.fileExists(atPath: dir.path) else { continue }
-
-            do {
-                try validateInstall(modelDir: dir, source: source)
-                let hasTok = hasTokenizer(for: source.id)
-                updateState(for: source.id, state: hasTok ? .installed : .installedMissingTokenizer)
-            } catch {
-                logger.warning("Existing model \(source.id) failed validation: \(error.localizedDescription)")
-                updateState(for: source.id, state: .notDownloaded)
+            if fileManager.fileExists(atPath: dir.path) {
+                do {
+                    try validateInstall(modelDir: dir, source: source)
+                    let hasTok = hasTokenizer(for: source.id)
+                    updateState(for: source.id, state: hasTok ? .installed : .installedMissingTokenizer)
+                    return
+                } catch {
+                    // fall through
+                }
             }
+            if case .unsupported(let reason) = source.downloadStrategy {
+                updateState(for: source.id, state: .unavailable(reason))
+            }
+            return
+        }
+
+        let dir = modelDirectory(for: source.id)
+        guard fileManager.fileExists(atPath: dir.path) else {
+            updateState(for: source.id, state: .notDownloaded)
+            return
+        }
+
+        do {
+            try validateInstall(modelDir: dir, source: source)
+            let hasTok = hasTokenizer(for: source.id)
+            updateState(for: source.id, state: hasTok ? .installed : .installedMissingTokenizer)
+        } catch {
+            logger.warning("Existing model \(source.id) failed validation: \(error.localizedDescription)")
+            updateState(for: source.id, state: .notDownloaded)
         }
     }
 
@@ -794,9 +806,9 @@ final class ModelDownloadManager {
 
     private func updateState(for sourceID: ModelSourceID, state: ModelDownloadState) {
         guard let source = ModelSourceCatalog.source(for: sourceID) else { return }
-        if source.isChat {
+        if source.isChat && sourceID == selectedChatSourceID {
             llmState = state
-        } else if source.isEmbedding {
+        } else if source.isEmbedding && sourceID == selectedEmbeddingSourceID {
             embeddingState = state
         }
     }

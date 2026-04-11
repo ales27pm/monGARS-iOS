@@ -52,6 +52,24 @@ struct ContentView: View {
                         await coordinator.loadAllAvailable()
                     }
                 }
+                .onChange(of: modelDownloadManager.llmState) { _, newState in
+                    if newState.isInstalled || newState.isInstalledPartially {
+                        if let coordinator = runtimeCoordinator, !coordinator.llmReady {
+                            Task {
+                                await coordinator.loadLLMIfAvailable()
+                            }
+                        }
+                    }
+                }
+                .onChange(of: modelDownloadManager.embeddingState) { _, newState in
+                    if newState.isInstalled {
+                        if let coordinator = runtimeCoordinator, !coordinator.embeddingReady {
+                            Task {
+                                await coordinator.loadEmbeddingIfAvailable()
+                            }
+                        }
+                    }
+                }
         }
     }
 
