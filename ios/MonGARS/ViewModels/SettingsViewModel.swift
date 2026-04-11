@@ -18,11 +18,26 @@ final class SettingsViewModel {
         self.localeManager = localeManager
         self.modelDownloadManager = modelDownloadManager
         self.permissionsManager = permissionsManager
+
+        if let storedVariant = SecureStoreService.syncLoad(key: .selectedModelVariant),
+           let variant = ModelVariant(rawValue: storedVariant) {
+            modelDownloadManager.selectedLLMVariant = variant
+        }
     }
 
     var selectedLanguage: AppLanguage {
         get { localeManager.currentLanguage }
         set { localeManager.currentLanguage = newValue }
+    }
+
+    var selectedModelVariant: ModelVariant {
+        get { modelDownloadManager.selectedLLMVariant }
+        set {
+            modelDownloadManager.selectedLLMVariant = newValue
+            Task {
+                try? await SecureStoreService.shared.save(key: .selectedModelVariant, value: newValue.rawValue)
+            }
+        }
     }
 
     func deleteModel(_ variant: ModelVariant) {

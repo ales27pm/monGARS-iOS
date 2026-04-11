@@ -4,11 +4,12 @@ import Foundation
 nonisolated final class GetWeatherTool: ToolExecutable, @unchecked Sendable {
     let schema = ToolSchema(
         name: "get_weather",
-        description: "Gets basic weather information for the user's current location or a specified city.",
+        description: "Gets basic weather information for the user's current location or a specified city. This tool requires an active internet connection and will fail if the device is offline.",
         parameters: [
             ToolParameter(name: "city", description: "City name to get weather for (uses current location if omitted)", type: .string, required: false),
         ],
-        requiresApproval: false
+        requiresApproval: false,
+        requiresNetwork: true
     )
 
     private let locationService: LocationService
@@ -70,7 +71,7 @@ nonisolated final class GetWeatherTool: ToolExecutable, @unchecked Sendable {
             Wind Speed: \(String(format: "%.1f", windSpeed)) km/h
             """)
         } catch {
-            return .failure("Weather request failed: \(error.localizedDescription)")
+            return .failure("Weather request failed (network may be unavailable): \(error.localizedDescription)")
         }
     }
 

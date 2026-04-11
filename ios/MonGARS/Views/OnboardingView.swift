@@ -223,17 +223,18 @@ struct OnboardingView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                case .paused(let progress):
+                case .installing:
                     VStack(spacing: 8) {
-                        ProgressView(value: progress)
-                            .tint(.orange)
-                        Text(viewModel.localeManager.localizedString("Paused", "En pause"))
-                            .font(.caption)
-                            .foregroundStyle(.orange)
+                        ProgressView()
+                        if let phase = viewModel.installPhaseDescription {
+                            Text(phase)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
-                case .downloaded:
+                case .installed:
                     Label(
-                        viewModel.localeManager.localizedString("Downloaded", "T\u{00E9}l\u{00E9}charg\u{00E9}"),
+                        viewModel.localeManager.localizedString("Installed", "Install\u{00E9}"),
                         systemImage: "checkmark.circle.fill"
                     )
                     .foregroundStyle(.green)
@@ -261,7 +262,7 @@ struct OnboardingView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                } else if viewModel.isDownloading {
+                } else if viewModel.isDownloading || viewModel.isInstalling {
                     Button {
                         viewModel.cancelDownload()
                     } label: {

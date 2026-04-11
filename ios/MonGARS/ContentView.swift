@@ -7,11 +7,17 @@ struct ContentView: View {
     @Environment(PermissionsManager.self) private var permissionsManager
     @Environment(ToolRegistry.self) private var toolRegistry
 
-    @AppStorage("has_completed_onboarding") private var hasCompletedOnboarding = false
     @State private var selectedTab: AppTab = .conversations
     @State private var selectedConversation: Conversation?
     @State private var showNewChat = false
     @State private var runtimeCoordinator: ModelRuntimeCoordinator?
+    @State private var memoryService: SemanticMemoryService?
+    @State private var embeddingStore = EmbeddingStore()
+
+    private var hasCompletedOnboarding: Bool {
+        SecureStoreService.syncExists(key: .onboardingCompleted)
+            || UserDefaults.standard.bool(forKey: "has_completed_onboarding")
+    }
 
     var body: some View {
         if !hasCompletedOnboarding {
@@ -22,6 +28,19 @@ struct ContentView: View {
                     if runtimeCoordinator == nil {
                         let coordinator = ModelRuntimeCoordinator(modelDownloadManager: modelDownloadManager)
                         runtimeCoordinator = coordinator
+
+                        do {
+                            try await embeddingStore.open()
+                        } catch {
+                            print("EmbeddingStore open failed: \(error)")
+                        }
+
+                        let memory = SemanticMemoryService(
+                            embeddingStore: embeddingStore,
+                            embeddingEngine: coordinator.embeddingEngine
+                        )
+                        memoryService = memory
+
                         await coordinator.loadAllAvailable()
                     }
                 }
@@ -86,7 +105,8 @@ struct ContentView: View {
             let agent = AgentOrchestrator(
                 llmEngine: coordinator.llmEngine,
                 toolRegistry: toolRegistry,
-                localeManager: localeManager
+                localeManager: localeManager,
+                memoryService: memoryService
             )
 
             ChatView(

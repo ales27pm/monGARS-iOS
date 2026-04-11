@@ -1,5 +1,14 @@
 import Foundation
+import ZIPFoundation
 import os
+
+nonisolated enum InstallPhase: String, Sendable {
+    case downloading
+    case extracting
+    case validating
+    case installingTokenizer
+    case complete
+}
 
 @Observable
 @MainActor
@@ -7,6 +16,7 @@ final class ModelDownloadManager {
     var llmState: ModelDownloadState = .notDownloaded
     var embeddingState: ModelDownloadState = .notDownloaded
     var selectedLLMVariant: ModelVariant = .llama1B
+    var currentInstallPhase: InstallPhase?
 
     private var activeTasks: [ModelVariant: URLSessionDownloadTask] = [:]
     private var progressObservations: [ModelVariant: NSKeyValueObservation] = [:]
@@ -17,8 +27,8 @@ final class ModelDownloadManager {
         checkExistingModels()
     }
 
-    var isLLMReady: Bool { llmState.isDownloaded }
-    var isEmbeddingReady: Bool { embeddingState.isDownloaded }
+    var isLLMReady: Bool { llmState.isInstalled }
+    var isEmbeddingReady: Bool { embeddingState.isInstalled }
     var isFullyReady: Bool { isLLMReady }
 
     var llmStorageUsed: String {
@@ -32,12 +42,18 @@ final class ModelDownloadManager {
     }
 
     func startDownload(variant: ModelVariant) {
-        guard let url = downloadURL(for: variant) else {
+        guard let url = archiveDownloadURL(for: variant) else {
             updateState(for: variant, state: .error("Invalid download URL"))
             return
         }
 
+        guard hasSufficientSpace(for: variant) else {
+            updateState(for: variant, state: .error("Insufficient disk space"))
+            return
+        }
+
         updateState(for: variant, state: .downloading(progress: 0))
+        currentInstallPhase = .downloading
 
         let task = URLSession.shared.downloadTask(with: url) { [weak self] tempURL, response, error in
             Task { @MainActor [weak self] in
@@ -51,22 +67,24 @@ final class ModelDownloadManager {
                     } else {
                         self.updateState(for: variant, state: .error(error.localizedDescription))
                     }
+                    self.currentInstallPhase = nil
                     return
                 }
 
                 guard let tempURL else {
                     self.updateState(for: variant, state: .error("Download failed: no file received"))
+                    self.currentInstallPhase = nil
                     return
                 }
 
-                do {
-                    try self.installDownloadedFile(tempURL: tempURL, variant: variant)
-                    self.updateState(for: variant, state: .downloaded)
-                    self.logger.info("Model installed: \(variant.rawValue)")
-                } catch {
-                    self.updateState(for: variant, state: .error("Install failed: \(error.localizedDescription)"))
-                    self.logger.error("Install error for \(variant.rawValue): \(error.localizedDescription)")
+                guard let response = response as? HTTPURLResponse, (200...299).contains(response.statusCode) else {
+                    self.updateState(for: variant, state: .error("Server returned an error"))
+                    self.currentInstallPhase = nil
+                    return
                 }
+
+                self.updateState(for: variant, state: .installing)
+                await self.installModel(archiveURL: tempURL, variant: variant)
             }
         }
 
@@ -84,19 +102,23 @@ final class ModelDownloadManager {
         activeTasks[variant]?.cancel()
         activeTasks.removeValue(forKey: variant)
         progressObservations.removeValue(forKey: variant)
+        currentInstallPhase = nil
         updateState(for: variant, state: .notDownloaded)
     }
 
     func deleteModel(variant: ModelVariant) {
-        let path = modelDirectory(for: variant)
-        try? fileManager.removeItem(at: path)
+        let modelDir = modelDirectory(for: variant)
+        try? fileManager.removeItem(at: modelDir)
+
+        let tokDir = modelsBaseDirectory().appendingPathComponent(variant.tokenizerFolderName, isDirectory: true)
+        try? fileManager.removeItem(at: tokDir)
+
         updateState(for: variant, state: .notDownloaded)
         logger.info("Model deleted: \(variant.rawValue)")
     }
 
     func modelsBaseDirectory() -> URL {
-        let docs = URL.documentsDirectory
-        return docs.appending(path: "models", directoryHint: .isDirectory)
+        URL.documentsDirectory.appending(path: "models", directoryHint: .isDirectory)
     }
 
     func modelDirectory(for variant: ModelVariant) -> URL {
@@ -116,13 +138,13 @@ final class ModelDownloadManager {
             return mlpackage
         }
 
-        let mlmodel = dir.appendingPathComponent("\(variant.rawValue).mlmodel")
-        if fileManager.fileExists(atPath: mlmodel.path) {
-            return mlmodel
-        }
-
-        if fileManager.fileExists(atPath: dir.path) {
-            return dir
+        if let contents = try? fileManager.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+            if let compiledModel = contents.first(where: { $0.pathExtension == "mlmodelc" }) {
+                return compiledModel
+            }
+            if let packageModel = contents.first(where: { $0.pathExtension == "mlpackage" }) {
+                return packageModel
+            }
         }
 
         return nil
@@ -160,37 +182,151 @@ final class ModelDownloadManager {
         return availableDiskSpaceBytes > (required + buffer)
     }
 
-    private func installDownloadedFile(tempURL: URL, variant: ModelVariant) throws {
-        let destDir = modelDirectory(for: variant)
-        let parentDir = destDir.deletingLastPathComponent()
+    private func installModel(archiveURL: URL, variant: ModelVariant) async {
+        let stagingDir = modelsBaseDirectory().appendingPathComponent("staging-\(variant.rawValue)", isDirectory: true)
 
-        if !fileManager.fileExists(atPath: parentDir.path) {
-            try fileManager.createDirectory(at: parentDir, withIntermediateDirectories: true)
+        do {
+            try cleanAndCreateDirectory(at: stagingDir)
+
+            currentInstallPhase = .extracting
+            logger.info("Extracting archive for \(variant.rawValue)...")
+            try extractArchive(at: archiveURL, to: stagingDir)
+
+            currentInstallPhase = .validating
+            let modelArtifactURL = try locateModelArtifact(in: stagingDir, variant: variant)
+            logger.info("Found model artifact: \(modelArtifactURL.lastPathComponent)")
+
+            let destDir = modelDirectory(for: variant)
+            try cleanAndCreateDirectory(at: destDir)
+
+            let destModelURL = destDir.appendingPathComponent(modelArtifactURL.lastPathComponent)
+            try fileManager.moveItem(at: modelArtifactURL, to: destModelURL)
+
+            currentInstallPhase = .installingTokenizer
+            await downloadTokenizerFiles(variant: variant, to: destDir)
+
+            try validateInstall(modelDir: destDir, variant: variant)
+
+            var mutableDest = destDir
+            var resourceValues = URLResourceValues()
+            resourceValues.isExcludedFromBackup = true
+            try mutableDest.setResourceValues(resourceValues)
+
+            try? fileManager.removeItem(at: stagingDir)
+            try? fileManager.removeItem(at: archiveURL)
+
+            currentInstallPhase = .complete
+            updateState(for: variant, state: .installed)
+            logger.info("Model installed successfully: \(variant.rawValue)")
+
+        } catch {
+            try? fileManager.removeItem(at: stagingDir)
+            let msg = "Install failed: \(error.localizedDescription)"
+            updateState(for: variant, state: .error(msg))
+            logger.error("\(msg)")
         }
 
-        if fileManager.fileExists(atPath: destDir.path) {
-            try fileManager.removeItem(at: destDir)
+        currentInstallPhase = nil
+    }
+
+    private func extractArchive(at archiveURL: URL, to destinationDir: URL) throws {
+        let archiveData = try Data(contentsOf: archiveURL, options: .mappedIfSafe)
+        let headerBytes = [UInt8](archiveData.prefix(4))
+        let isZip = headerBytes.count >= 4 && headerBytes[0] == 0x50 && headerBytes[1] == 0x4B && headerBytes[2] == 0x03 && headerBytes[3] == 0x04
+
+        guard isZip else {
+            throw ModelInstallError.invalidArchive
         }
 
-        try fileManager.createDirectory(at: destDir, withIntermediateDirectories: true)
+        try fileManager.unzipItem(at: archiveURL, to: destinationDir)
+    }
 
-        let tempFilePath = tempURL.path
-        let destFile = destDir.appendingPathComponent(variant.modelFileName)
-        try fileManager.moveItem(atPath: tempFilePath, toPath: destFile.path)
+    private func locateModelArtifact(in directory: URL, variant: ModelVariant) throws -> URL {
+        let enumerator = fileManager.enumerator(at: directory, includingPropertiesForKeys: [.isDirectoryKey], options: [])
 
-        logger.info("Installed model file to \(destDir.lastPathComponent)/\(variant.modelFileName)")
+        var bestCandidate: URL?
+        var candidateExtension = ""
 
-        var resourceValues = URLResourceValues()
-        resourceValues.isExcludedFromBackup = true
-        var mutableDest = destDir
-        try mutableDest.setResourceValues(resourceValues)
+        while let url = enumerator?.nextObject() as? URL {
+            let ext = url.pathExtension
+            if ext == "mlmodelc" {
+                return url
+            }
+            if ext == "mlpackage" && candidateExtension != "mlmodelc" {
+                bestCandidate = url
+                candidateExtension = ext
+            }
+            if ext == "mlmodel" && bestCandidate == nil {
+                bestCandidate = url
+                candidateExtension = ext
+            }
+        }
+
+        if let candidate = bestCandidate {
+            return candidate
+        }
+
+        throw ModelInstallError.modelNotFoundInArchive
+    }
+
+    private func downloadTokenizerFiles(variant: ModelVariant, to directory: URL) async {
+        for fileName in variant.tokenizerFiles {
+            let destFile = directory.appendingPathComponent(fileName)
+            if fileManager.fileExists(atPath: destFile.path) { continue }
+
+            guard let url = tokenizerFileURL(for: variant, fileName: fileName) else { continue }
+
+            do {
+                let (data, response) = try await URLSession.shared.data(from: url)
+                guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
+                    logger.warning("Tokenizer file \(fileName) not available (HTTP error)")
+                    continue
+                }
+                try data.write(to: destFile, options: .atomic)
+                logger.info("Downloaded tokenizer file: \(fileName)")
+            } catch {
+                logger.warning("Failed to download tokenizer file \(fileName): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func validateInstall(modelDir: URL, variant: ModelVariant) throws {
+        guard fileManager.fileExists(atPath: modelDir.path) else {
+            throw ModelInstallError.validationFailed("Model directory does not exist")
+        }
+
+        guard let contents = try? fileManager.contentsOfDirectory(at: modelDir, includingPropertiesForKeys: nil),
+              !contents.isEmpty else {
+            throw ModelInstallError.validationFailed("Model directory is empty")
+        }
+
+        let hasModel = contents.contains { url in
+            let ext = url.pathExtension
+            return ext == "mlmodelc" || ext == "mlpackage" || ext == "mlmodel"
+        }
+
+        guard hasModel else {
+            throw ModelInstallError.validationFailed("No Core ML model found in install directory")
+        }
+
+        let dirSize = directorySize(at: modelDir)
+        let minimumExpected = variant.estimatedSizeBytes / 10
+        guard dirSize > minimumExpected else {
+            throw ModelInstallError.validationFailed("Installed model appears too small (\(dirSize) bytes)")
+        }
     }
 
     private func checkExistingModels() {
         for variant in ModelVariant.allCases {
             let dir = modelDirectory(for: variant)
-            if fileManager.fileExists(atPath: dir.path) {
-                updateState(for: variant, state: .downloaded)
+            guard fileManager.fileExists(atPath: dir.path) else { continue }
+
+            do {
+                try validateInstall(modelDir: dir, variant: variant)
+                updateState(for: variant, state: .installed)
+            } catch {
+                logger.warning("Existing model \(variant.rawValue) failed validation: \(error.localizedDescription)")
+                updateState(for: variant, state: .notDownloaded)
             }
         }
     }
@@ -203,8 +339,19 @@ final class ModelDownloadManager {
         }
     }
 
-    private func downloadURL(for variant: ModelVariant) -> URL? {
-        URL(string: "https://huggingface.co/coreml-community/\(variant.rawValue)/resolve/main/model.mlpackage.zip")
+    private func archiveDownloadURL(for variant: ModelVariant) -> URL? {
+        URL(string: "https://huggingface.co/\(variant.huggingFaceRepo)/resolve/main/\(variant.archiveFileName)")
+    }
+
+    private func tokenizerFileURL(for variant: ModelVariant, fileName: String) -> URL? {
+        URL(string: "https://huggingface.co/\(variant.huggingFaceRepo)/resolve/main/\(fileName)")
+    }
+
+    private func cleanAndCreateDirectory(at url: URL) throws {
+        if fileManager.fileExists(atPath: url.path) {
+            try fileManager.removeItem(at: url)
+        }
+        try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
     }
 
     private func directorySizeString(at url: URL) -> String {
@@ -227,9 +374,4 @@ final class ModelDownloadManager {
         }
         return total
     }
-}
-
-nonisolated enum ModelInstallError: Error, Sendable {
-    case extractionFailed(String)
-    case invalidArchive
 }

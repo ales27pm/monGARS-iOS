@@ -21,8 +21,17 @@ nonisolated struct ToolSchema: Codable, Sendable, Identifiable {
     let description: String
     let parameters: [ToolParameter]
     let requiresApproval: Bool
+    let requiresNetwork: Bool
 
     nonisolated var id: String { name }
+
+    init(name: String, description: String, parameters: [ToolParameter], requiresApproval: Bool, requiresNetwork: Bool = false) {
+        self.name = name
+        self.description = description
+        self.parameters = parameters
+        self.requiresApproval = requiresApproval
+        self.requiresNetwork = requiresNetwork
+    }
 }
 
 nonisolated struct ToolCallRequest: Sendable, Identifiable {

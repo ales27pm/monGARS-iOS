@@ -55,17 +55,33 @@ nonisolated enum ModelVariant: String, Codable, Sendable, CaseIterable, Identifi
     var tokenizerFolderName: String {
         "\(rawValue)-tokenizer"
     }
+
+    var archiveFileName: String {
+        "model.mlpackage.zip"
+    }
+
+    var tokenizerFiles: [String] {
+        ["tokenizer.json", "tokenizer_config.json"]
+    }
+
+    var huggingFaceRepo: String {
+        switch self {
+        case .llama1B: "coreml-community/llama-3.2-1b-instruct"
+        case .llama3B: "coreml-community/llama-3.2-3b-instruct"
+        case .graniteEmbedding: "coreml-community/granite-embedding-278m-multilingual"
+        }
+    }
 }
 
 nonisolated enum ModelDownloadState: Sendable, Equatable {
     case notDownloaded
     case downloading(progress: Double)
-    case paused(progress: Double)
-    case downloaded
+    case installing
+    case installed
     case error(String)
 
-    var isDownloaded: Bool {
-        if case .downloaded = self { return true }
+    var isInstalled: Bool {
+        if case .installed = self { return true }
         return false
     }
 
@@ -73,10 +89,27 @@ nonisolated enum ModelDownloadState: Sendable, Equatable {
         if case .downloading = self { return true }
         return false
     }
+
+    var isInstalling: Bool {
+        if case .installing = self { return true }
+        return false
+    }
+
+    var isDownloaded: Bool { isInstalled }
 }
 
 nonisolated struct ModelFileInfo: Sendable {
     let variant: ModelVariant
     let localURL: URL
     let sizeOnDisk: Int64
+}
+
+nonisolated enum ModelInstallError: Error, Sendable {
+    case extractionFailed(String)
+    case invalidArchive
+    case modelNotFoundInArchive
+    case tokenizerDownloadFailed(String)
+    case validationFailed(String)
+    case insufficientSpace
+    case stagingCleanupFailed
 }

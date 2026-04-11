@@ -4,13 +4,20 @@ import SwiftUI
 @main
 struct MonGARSApp: App {
     @State private var localeManager = LocaleManager()
-    @State private var modelDownloadManager = ModelDownloadManager()
+    @State private var modelDownloadManager: ModelDownloadManager
     @State private var permissionsManager = PermissionsManager()
     @State private var toolRegistry = ToolRegistry()
     @State private var locationService = LocationService()
-    @State private var runtimeCoordinator: ModelRuntimeCoordinator?
-    @State private var embeddingStore = EmbeddingStore()
     @State private var toolsRegistered = false
+
+    init() {
+        var manager = ModelDownloadManager()
+        if let storedVariant = SecureStoreService.syncLoad(key: .selectedModelVariant),
+           let variant = ModelVariant(rawValue: storedVariant) {
+            manager.selectedLLMVariant = variant
+        }
+        _modelDownloadManager = State(initialValue: manager)
+    }
 
     var body: some Scene {
         WindowGroup {
@@ -24,16 +31,6 @@ struct MonGARSApp: App {
                     if !toolsRegistered {
                         registerTools()
                         toolsRegistered = true
-                    }
-                    do {
-                        try await embeddingStore.open()
-                    } catch {
-                        print("EmbeddingStore open failed: \(error)")
-                    }
-                    if runtimeCoordinator == nil {
-                        let coordinator = ModelRuntimeCoordinator(modelDownloadManager: modelDownloadManager)
-                        runtimeCoordinator = coordinator
-                        await coordinator.loadAllAvailable()
                     }
                 }
         }

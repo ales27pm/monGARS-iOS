@@ -6,21 +6,28 @@ final class AgentOrchestrator {
     let llmEngine: LLMEngine
     let toolRegistry: ToolRegistry
     let localeManager: LocaleManager
+    let memoryService: SemanticMemoryService?
 
     var pendingToolCall: ToolCallRequest?
     var isProcessing: Bool = false
 
-    init(llmEngine: LLMEngine, toolRegistry: ToolRegistry, localeManager: LocaleManager) {
+    init(llmEngine: LLMEngine, toolRegistry: ToolRegistry, localeManager: LocaleManager, memoryService: SemanticMemoryService? = nil) {
         self.llmEngine = llmEngine
         self.toolRegistry = toolRegistry
         self.localeManager = localeManager
+        self.memoryService = memoryService
     }
 
-    func compilePrompt(messages: [Message], language: AppLanguage) -> String {
+    func compilePrompt(messages: [Message], language: AppLanguage, retrievedContext: String? = nil) -> String {
         var prompt = "<|begin_of_text|>"
 
         prompt += "<|start_header_id|>system<|end_header_id|>\n\n"
         prompt += systemPrompt(for: language)
+
+        if let context = retrievedContext {
+            prompt += "\n\n" + context
+        }
+
         prompt += "<|eot_id|>"
 
         let recentMessages = Array(messages.suffix(20))
@@ -39,10 +46,8 @@ final class AgentOrchestrator {
         return prompt
     }
 
-    func generateResponse(messages: [Message], language: AppLanguage, config: GenerationConfig = .default) -> AsyncThrowingStream<String, Error> {
-        let prompt = compilePrompt(messages: messages, language: language)
-
-        return AsyncThrowingStream { continuation in
+    func generateResponse(messages: [Message], language: AppLanguage, conversationId: String? = nil, config: GenerationConfig = .default) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
             Task {
                 isProcessing = true
                 defer { isProcessing = false }
@@ -52,6 +57,16 @@ final class AgentOrchestrator {
                     continuation.finish(throwing: AgentError.modelNotReady)
                     return
                 }
+
+                var retrievedContext: String?
+                if let memoryService, let lastUserMsg = messages.last(where: { $0.messageRole == .user }) {
+                    retrievedContext = await memoryService.buildContextBlock(
+                        for: lastUserMsg.content,
+                        language: language.rawValue
+                    )
+                }
+
+                let prompt = compilePrompt(messages: messages, language: language, retrievedContext: retrievedContext)
 
                 let stream = await llmEngine.generate(
                     prompt: prompt,
@@ -71,6 +86,18 @@ final class AgentOrchestrator {
 
                     if let toolCall = parseToolCall(from: fullResponse) {
                         pendingToolCall = toolCall
+                    }
+
+                    if let memoryService,
+                       let lastUserMsg = messages.last(where: { $0.messageRole == .user }),
+                       !fullResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        let convId = conversationId ?? "unknown"
+                        await memoryService.ingestConversationTurn(
+                            userMessage: lastUserMsg.content,
+                            assistantResponse: fullResponse,
+                            conversationId: convId,
+                            language: language.rawValue
+                        )
                     }
 
                     continuation.finish()
@@ -93,7 +120,7 @@ final class AgentOrchestrator {
     }
 
     private func systemPrompt(for language: AppLanguage) -> String {
-        let toolDescriptions = toolRegistry.availableToolDescriptions()
+        let toolDescriptions = toolRegistry.availableToolDescriptions(offlineOnly: false)
 
         let base: String
         switch language {

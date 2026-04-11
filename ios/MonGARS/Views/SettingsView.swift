@@ -70,7 +70,7 @@ struct SettingsView: View {
                         systemImage: "trash"
                     )
                 }
-            } else if !viewModel.modelDownloadManager.llmState.isDownloading {
+            } else if !viewModel.modelDownloadManager.llmState.isDownloading && !viewModel.modelDownloadManager.llmState.isInstalling {
                 Button {
                     viewModel.downloadModel(viewModel.modelDownloadManager.selectedLLMVariant)
                 } label: {
@@ -191,7 +191,7 @@ struct SettingsView: View {
     @ViewBuilder
     private func modelStatusBadge(_ state: ModelDownloadState) -> some View {
         switch state {
-        case .downloaded:
+        case .installed:
             Text(viewModel.localeManager.localizedString("Ready", "Pr\u{00EA}t"))
                 .font(.caption)
                 .foregroundStyle(.green)
@@ -202,6 +202,14 @@ struct SettingsView: View {
             Text("\(Int(progress * 100))%")
                 .font(.caption)
                 .foregroundStyle(.tint)
+        case .installing:
+            HStack(spacing: 4) {
+                ProgressView()
+                    .controlSize(.mini)
+                Text(viewModel.localeManager.localizedString("Installing", "Installation"))
+                    .font(.caption)
+                    .foregroundStyle(.tint)
+            }
         case .notDownloaded:
             Text(viewModel.localeManager.localizedString("Not Downloaded", "Non t\u{00E9}l\u{00E9}charg\u{00E9}"))
                 .font(.caption)
@@ -209,10 +217,6 @@ struct SettingsView: View {
         case .error:
             Image(systemName: "exclamationmark.triangle")
                 .foregroundStyle(.red)
-        case .paused:
-            Text(viewModel.localeManager.localizedString("Paused", "En pause"))
-                .font(.caption)
-                .foregroundStyle(.orange)
         }
     }
 }

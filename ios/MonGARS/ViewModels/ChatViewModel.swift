@@ -155,11 +155,14 @@ final class ChatViewModel {
         streamingContent = ""
         errorMessage = nil
 
+        let conversationId = currentConversation?.id.uuidString
+
         generationTask = Task {
             do {
                 let stream = agent.generateResponse(
                     messages: messages,
-                    language: localeManager.currentLanguage
+                    language: localeManager.currentLanguage,
+                    conversationId: conversationId
                 )
 
                 for try await token in stream {

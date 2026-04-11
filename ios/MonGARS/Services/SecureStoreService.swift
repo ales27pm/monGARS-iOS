@@ -29,6 +29,32 @@ actor SecureStoreService {
         exists(rawKey: key.rawValue)
     }
 
+    static func syncExists(key: SecureStoreKey) -> Bool {
+        let serviceName = "com.mongars.securestore"
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: key.rawValue,
+            kSecReturnData as String: false
+        ]
+        return SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess
+    }
+
+    static func syncLoad(key: SecureStoreKey) -> String? {
+        let serviceName = "com.mongars.securestore"
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: key.rawValue,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
     func save(rawKey: String, value: String) throws {
         guard let data = value.data(using: .utf8) else {
             throw SecureStoreError.encodingFailed

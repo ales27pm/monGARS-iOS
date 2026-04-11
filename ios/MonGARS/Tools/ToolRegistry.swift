@@ -20,21 +20,39 @@ final class ToolRegistry {
         tools[toolName]?.schema.requiresApproval ?? true
     }
 
-    func availableToolDescriptions() -> String {
-        tools.values.map { tool in
+    func isNetworkRequired(toolName: String) -> Bool {
+        tools[toolName]?.schema.requiresNetwork ?? false
+    }
+
+    func availableToolDescriptions(offlineOnly: Bool = false) -> String {
+        let filtered = tools.values.filter { tool in
+            if offlineOnly { return !tool.schema.requiresNetwork }
+            return true
+        }
+
+        return filtered.map { tool in
             let params = tool.schema.parameters.map { p in
                 "  - \(p.name) (\(p.type.rawValue), \(p.required ? "required" : "optional")): \(p.description)"
             }.joined(separator: "\n")
 
-            return """
-            \(tool.schema.name): \(tool.schema.description)
-            Parameters:
-            \(params)
-            """
+            var desc = "\(tool.schema.name): \(tool.schema.description)"
+            if tool.schema.requiresNetwork {
+                desc += " [requires network]"
+            }
+            desc += "\nParameters:\n\(params)"
+            return desc
         }.joined(separator: "\n\n")
     }
 
     var registeredSchemas: [ToolSchema] {
         tools.values.map(\.schema)
+    }
+
+    var offlineSchemas: [ToolSchema] {
+        tools.values.filter { !$0.schema.requiresNetwork }.map(\.schema)
+    }
+
+    var networkSchemas: [ToolSchema] {
+        tools.values.filter { $0.schema.requiresNetwork }.map(\.schema)
     }
 }

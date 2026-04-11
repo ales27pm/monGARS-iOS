@@ -7,18 +7,26 @@ final class OnboardingViewModel {
     let localeManager: LocaleManager
 
     var currentStep: OnboardingStep = .welcome
-    var hasCompletedOnboarding: Bool {
-        get { UserDefaults.standard.bool(forKey: "has_completed_onboarding") }
-        set { UserDefaults.standard.set(newValue, forKey: "has_completed_onboarding") }
-    }
 
     init(modelDownloadManager: ModelDownloadManager, localeManager: LocaleManager) {
         self.modelDownloadManager = modelDownloadManager
         self.localeManager = localeManager
     }
 
+    var hasCompletedOnboarding: Bool {
+        get {
+            let exists = SecureStoreService.syncExists(key: .onboardingCompleted)
+            if exists { return true }
+            return UserDefaults.standard.bool(forKey: "has_completed_onboarding")
+        }
+    }
+
     var isDownloading: Bool {
         modelDownloadManager.llmState.isDownloading
+    }
+
+    var isInstalling: Bool {
+        modelDownloadManager.llmState.isInstalling
     }
 
     var isModelReady: Bool {
@@ -37,6 +45,22 @@ final class OnboardingViewModel {
             return msg
         }
         return nil
+    }
+
+    var installPhaseDescription: String? {
+        guard let phase = modelDownloadManager.currentInstallPhase else { return nil }
+        switch phase {
+        case .downloading:
+            return localeManager.localizedString("Downloading...", "Téléchargement...")
+        case .extracting:
+            return localeManager.localizedString("Extracting model...", "Extraction du modèle...")
+        case .validating:
+            return localeManager.localizedString("Validating...", "Validation...")
+        case .installingTokenizer:
+            return localeManager.localizedString("Installing tokenizer...", "Installation du tokenizer...")
+        case .complete:
+            return localeManager.localizedString("Complete", "Terminé")
+        }
     }
 
     func startDownload() {
@@ -58,12 +82,19 @@ final class OnboardingViewModel {
         case .modelDownload:
             currentStep = .complete
         case .complete:
-            hasCompletedOnboarding = true
+            markOnboardingComplete()
         }
     }
 
     func skipToComplete() {
-        hasCompletedOnboarding = true
+        markOnboardingComplete()
+    }
+
+    private func markOnboardingComplete() {
+        Task {
+            try? await SecureStoreService.shared.save(key: .onboardingCompleted, value: "true")
+        }
+        UserDefaults.standard.set(true, forKey: "has_completed_onboarding")
     }
 }
 
