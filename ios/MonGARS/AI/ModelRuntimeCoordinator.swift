@@ -13,6 +13,19 @@ nonisolated enum RuntimeState: Sendable, Equatable {
 @Observable
 @MainActor
 final class ModelRuntimeCoordinator {
+    nonisolated enum LLMRuntimeFailureCategory: Sendable, Equatable {
+        case modelFilesMissing
+        case tokenizerInvalid
+        case outOfMemory
+        case initializationFailed
+    }
+
+    nonisolated enum LLMAvailabilityIssue: Sendable, Equatable {
+        case notInstalled
+        case tokenizerMissing
+        case runtimeLoadFailed(LLMRuntimeFailureCategory)
+    }
+
     let llmEngine: LLMEngine
     let embeddingEngine: EmbeddingEngine
     let diagnostics: InferenceDiagnostics
@@ -21,10 +34,14 @@ final class ModelRuntimeCoordinator {
     private(set) var runtimeState: RuntimeState = .idle
     private(set) var llmReady: Bool = false
     private(set) var embeddingReady: Bool = false
+    private(set) var lastLLMLoadError: String?
+    private(set) var lastLLMLoadFailureCategory: LLMRuntimeFailureCategory?
 
     private let logger = Logger(subsystem: "com.mongars.ai", category: "runtime")
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var thermalObserver: NSObjectProtocol?
+    private var chatReloadTask: Task<Void, Never>?
+    private var embeddingReloadTask: Task<Void, Never>?
 
     init(modelDownloadManager: ModelDownloadManager) {
         let diag = InferenceDiagnostics()
@@ -41,24 +58,34 @@ final class ModelRuntimeCoordinator {
     }
 
     func loadLLMIfAvailable() async {
+        await loadLLMIfAvailable(expectedSourceID: nil)
+    }
+
+    private func loadLLMIfAvailable(expectedSourceID: ModelSourceID?) async {
         let sourceID = modelDownloadManager.selectedChatSourceID
+        if let expectedSourceID, expectedSourceID != sourceID { return }
         let llmState = modelDownloadManager.llmState
         guard llmState.isDownloaded || llmState.isInstalledPartially else {
             runtimeState = .degraded("LLM model not downloaded")
+            clearLLMFailureState()
             return
         }
 
         guard modelDownloadManager.hasTokenizer(for: sourceID) else {
             runtimeState = .degraded("Tokenizer missing for \(sourceID). Chat model cannot load without tokenizer files.")
             llmReady = false
+            clearLLMFailureState()
             return
         }
 
         runtimeState = .loadingLLM
+        clearLLMFailureState()
 
         guard let modelURL = modelDownloadManager.modelFileURL(for: sourceID) else {
             runtimeState = .error("Model files not found on disk")
             llmReady = false
+            lastLLMLoadError = "Model files not found on disk"
+            lastLLMLoadFailureCategory = .modelFilesMissing
             return
         }
 
@@ -70,18 +97,39 @@ final class ModelRuntimeCoordinator {
 
         do {
             try await llmEngine.loadModel(sourceID: sourceID, modelURL: modelURL, tokenizerDirectory: tokenizerDir, contextWindow: contextWindow)
+            if let expectedSourceID, modelDownloadManager.selectedChatSourceID != expectedSourceID {
+                await llmEngine.unloadModel()
+                return
+            }
             await llmEngine.warmup()
+            if let expectedSourceID, modelDownloadManager.selectedChatSourceID != expectedSourceID {
+                await llmEngine.unloadModel()
+                return
+            }
             llmReady = await llmEngine.isReady
+            if let expectedSourceID, modelDownloadManager.selectedChatSourceID != expectedSourceID {
+                llmReady = false
+                await llmEngine.unloadModel()
+                return
+            }
             updateRuntimeState()
         } catch {
             logger.error("LLM load failed: \(error.localizedDescription)")
+            if let expectedSourceID, modelDownloadManager.selectedChatSourceID != expectedSourceID { return }
             runtimeState = .error("Failed to load language model: \(error.localizedDescription)")
             llmReady = false
+            lastLLMLoadError = error.localizedDescription
+            lastLLMLoadFailureCategory = classifyLLMLoadFailure(error)
         }
     }
 
     func loadEmbeddingIfAvailable() async {
+        await loadEmbeddingIfAvailable(expectedSourceID: nil)
+    }
+
+    private func loadEmbeddingIfAvailable(expectedSourceID: ModelSourceID?) async {
         let sourceID = modelDownloadManager.selectedEmbeddingSourceID
+        if let expectedSourceID, expectedSourceID != sourceID { return }
         guard modelDownloadManager.embeddingState.isDownloaded else { return }
 
         runtimeState = .loadingEmbedding
@@ -98,10 +146,20 @@ final class ModelRuntimeCoordinator {
 
         do {
             try await embeddingEngine.loadModel(sourceID: sourceID, modelURL: modelURL, tokenizerDirectory: tokenizerDir, contextWindow: contextWindow)
+            if let expectedSourceID, modelDownloadManager.selectedEmbeddingSourceID != expectedSourceID {
+                await embeddingEngine.unloadModel()
+                return
+            }
             embeddingReady = await embeddingEngine.isReady
+            if let expectedSourceID, modelDownloadManager.selectedEmbeddingSourceID != expectedSourceID {
+                embeddingReady = false
+                await embeddingEngine.unloadModel()
+                return
+            }
             updateRuntimeState()
         } catch {
             logger.error("Embedding load failed: \(error.localizedDescription)")
+            if let expectedSourceID, modelDownloadManager.selectedEmbeddingSourceID != expectedSourceID { return }
             embeddingReady = false
             updateRuntimeState()
         }
@@ -112,11 +170,58 @@ final class ModelRuntimeCoordinator {
         await loadEmbeddingIfAvailable()
     }
 
+    func requestChatReloadForSelectionChange() {
+        chatReloadTask?.cancel()
+        chatReloadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.reloadSelectedChatModelRuntime()
+        }
+    }
+
+    func requestEmbeddingReloadForSelectionChange() {
+        embeddingReloadTask?.cancel()
+        embeddingReloadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.reloadSelectedEmbeddingModelRuntime()
+        }
+    }
+
+    func reloadSelectedChatModelRuntime() async {
+        let startID = modelDownloadManager.selectedChatSourceID
+        await llmEngine.unloadModel()
+        guard modelDownloadManager.selectedChatSourceID == startID else { return }
+        llmReady = false
+        clearLLMFailureState()
+
+        let llmState = modelDownloadManager.llmState
+        guard llmState.isInstalled || llmState.isInstalledPartially else {
+            runtimeState = .degraded("LLM model not downloaded")
+            return
+        }
+
+        await loadLLMIfAvailable(expectedSourceID: startID)
+    }
+
+    func reloadSelectedEmbeddingModelRuntime() async {
+        let startID = modelDownloadManager.selectedEmbeddingSourceID
+        await embeddingEngine.unloadModel()
+        guard modelDownloadManager.selectedEmbeddingSourceID == startID else { return }
+        embeddingReady = false
+
+        guard modelDownloadManager.embeddingState.isInstalled else {
+            updateRuntimeState()
+            return
+        }
+
+        await loadEmbeddingIfAvailable(expectedSourceID: startID)
+    }
+
     func unloadAll() async {
         await llmEngine.unloadModel()
         await embeddingEngine.unloadModel()
         llmReady = false
         embeddingReady = false
+        clearLLMFailureState()
         runtimeState = .idle
     }
 
@@ -138,6 +243,7 @@ final class ModelRuntimeCoordinator {
         }
 
         await llmEngine.unloadModel()
+        clearLLMFailureState()
 
         do {
             guard let modelURL = modelDownloadManager.modelFileURL(for: fallbackID) else {
@@ -154,11 +260,37 @@ final class ModelRuntimeCoordinator {
         } catch {
             runtimeState = .error("Fallback load failed: \(error.localizedDescription)")
             llmReady = false
+            lastLLMLoadError = error.localizedDescription
+            lastLLMLoadFailureCategory = classifyLLMLoadFailure(error)
         }
     }
 
     var isFullyOperational: Bool {
         llmReady
+    }
+
+    var llmAvailabilityIssue: LLMAvailabilityIssue? {
+        let sourceID = modelDownloadManager.selectedChatSourceID
+        if !(modelDownloadManager.llmState.isInstalled || modelDownloadManager.llmState.isInstalledPartially) {
+            return .notInstalled
+        }
+        if !modelDownloadManager.hasTokenizer(for: sourceID) {
+            return .tokenizerMissing
+        }
+        guard !llmReady else { return nil }
+        if case .loadingLLM = runtimeState {
+            return nil
+        }
+        if case .idle = runtimeState {
+            return nil
+        }
+        if case .error = runtimeState {
+            return .runtimeLoadFailed(lastLLMLoadFailureCategory ?? .initializationFailed)
+        }
+        if lastLLMLoadFailureCategory != nil {
+            return .runtimeLoadFailed(lastLLMLoadFailureCategory ?? .initializationFailed)
+        }
+        return nil
     }
 
     private func updateRuntimeState() {
@@ -171,6 +303,25 @@ final class ModelRuntimeCoordinator {
         } else {
             runtimeState = .degraded("Some models not loaded")
         }
+    }
+
+    private func clearLLMFailureState() {
+        lastLLMLoadError = nil
+        lastLLMLoadFailureCategory = nil
+    }
+
+    private func classifyLLMLoadFailure(_ error: Error) -> LLMRuntimeFailureCategory {
+        let message = error.localizedDescription.lowercased()
+        if message.contains("tokenizer") {
+            return .tokenizerInvalid
+        }
+        if message.contains("memory") || message.contains("out of memory") {
+            return .outOfMemory
+        }
+        if message.contains("file") || message.contains("not found") || message.contains("missing") {
+            return .modelFilesMissing
+        }
+        return .initializationFailed
     }
 
     private func setupSystemMonitoring() {
@@ -203,6 +354,8 @@ final class ModelRuntimeCoordinator {
 
         if !llmReady {
             runtimeState = .degraded("Model unloaded due to memory pressure")
+            lastLLMLoadFailureCategory = .outOfMemory
+            lastLLMLoadError = "Model unloaded due to memory pressure"
         }
     }
 
@@ -215,6 +368,8 @@ final class ModelRuntimeCoordinator {
     }
 
     func cleanup() {
+        chatReloadTask?.cancel()
+        embeddingReloadTask?.cancel()
         memoryPressureSource?.cancel()
         if let thermalObserver {
             NotificationCenter.default.removeObserver(thermalObserver)

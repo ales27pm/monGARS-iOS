@@ -139,11 +139,50 @@ final class ChatViewModel {
 
     private func generateResponse() {
         guard isModelReady else {
+            let unavailableMessage: String
+            switch runtimeCoordinator.llmAvailabilityIssue {
+            case .notInstalled:
+                unavailableMessage = localeManager.localizedString(
+                    "The AI model is not installed yet. Please go to Settings to download it.",
+                    "Le modèle IA n'est pas encore installé. Veuillez aller dans les Réglages pour le télécharger."
+                )
+            case .tokenizerMissing:
+                unavailableMessage = localeManager.localizedString(
+                    "The selected AI model is installed, but tokenizer files are missing. Reinstall the model from Settings.",
+                    "Le modèle IA sélectionné est installé, mais les fichiers tokenizer sont manquants. Réinstallez le modèle depuis les Réglages."
+                )
+            case .runtimeLoadFailed(let category):
+                switch category {
+                case .modelFilesMissing:
+                    unavailableMessage = localeManager.localizedString(
+                        "The selected AI model is installed, but required model files are missing or invalid. Reinstall it from Settings.",
+                        "Le modèle IA sélectionné est installé, mais des fichiers requis sont manquants ou invalides. Réinstallez-le depuis les Réglages."
+                    )
+                case .tokenizerInvalid:
+                    unavailableMessage = localeManager.localizedString(
+                        "The selected AI model is installed, but tokenizer data is invalid. Reinstall the model from Settings.",
+                        "Le modèle IA sélectionné est installé, mais les données du tokenizer sont invalides. Réinstallez le modèle depuis les Réglages."
+                    )
+                case .outOfMemory:
+                    unavailableMessage = localeManager.localizedString(
+                        "The selected AI model could not be loaded due to memory pressure. Close other apps and try again.",
+                        "Le modèle IA sélectionné n'a pas pu être chargé à cause d'une pression mémoire. Fermez d'autres apps et réessayez."
+                    )
+                case .initializationFailed:
+                    unavailableMessage = localeManager.localizedString(
+                        "The selected AI model is installed, but runtime initialization failed. Please retry from Settings.",
+                        "Le modèle IA sélectionné est installé, mais l'initialisation du runtime a échoué. Veuillez réessayer depuis les Réglages."
+                    )
+                }
+            case .none:
+                unavailableMessage = localeManager.localizedString(
+                    "The AI model is currently unavailable. Please verify model settings.",
+                    "Le modèle IA est actuellement indisponible. Veuillez vérifier les réglages du modèle."
+                )
+            }
+
             let placeholder = Message(
-                content: localeManager.localizedString(
-                    "The AI model needs to be downloaded before I can respond. Please go to Settings to download the model.",
-                    "Le mod\u{00E8}le IA doit \u{00EA}tre t\u{00E9}l\u{00E9}charg\u{00E9} avant que je puisse r\u{00E9}pondre. Veuillez aller dans les R\u{00E9}glages pour t\u{00E9}l\u{00E9}charger le mod\u{00E8}le."
-                ),
+                content: unavailableMessage,
                 role: .assistant,
                 language: localeManager.currentLanguage
             )
