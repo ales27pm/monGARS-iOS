@@ -42,8 +42,15 @@ final class ModelRuntimeCoordinator {
 
     func loadLLMIfAvailable() async {
         let sourceID = modelDownloadManager.selectedChatSourceID
-        guard modelDownloadManager.llmState.isDownloaded else {
+        let llmState = modelDownloadManager.llmState
+        guard llmState.isDownloaded || llmState.isInstalledPartially else {
             runtimeState = .degraded("LLM model not downloaded")
+            return
+        }
+
+        guard modelDownloadManager.hasTokenizer(for: sourceID) else {
+            runtimeState = .degraded("Tokenizer missing for \(sourceID). Chat model cannot load without tokenizer files.")
+            llmReady = false
             return
         }
 

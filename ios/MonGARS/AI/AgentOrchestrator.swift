@@ -24,7 +24,7 @@ final class AgentOrchestrator {
 
     func compilePrompt(messages: [Message], language: AppLanguage, retrievedContext: String? = nil) -> String {
         switch promptFormat {
-        case .llama3:
+        case .llama3, .dolphin:
             return compileLlama3Prompt(messages: messages, language: language, retrievedContext: retrievedContext)
         case .qwen:
             return compileQwenPrompt(messages: messages, language: language, retrievedContext: retrievedContext)
@@ -123,7 +123,7 @@ final class AgentOrchestrator {
 
     private var stopTokenSequences: [String] {
         switch promptFormat {
-        case .llama3:
+        case .llama3, .dolphin:
             ["<|eot_id|>", "<|end_of_text|>"]
         case .qwen:
             ["<|im_end|>", "<|endoftext|>"]

@@ -10,6 +10,13 @@ nonisolated enum ModelRole: String, Sendable {
 nonisolated enum PromptFormat: String, Sendable {
     case llama3
     case qwen
+    case dolphin
+}
+
+nonisolated enum ArtifactType: String, Sendable {
+    case compiledModel
+    case mlpackageDirectory
+    case zipArchive
 }
 
 nonisolated enum DownloadStrategy: Sendable {
@@ -24,8 +31,11 @@ nonisolated struct ModelSource: Sendable, Identifiable {
     let repoID: String
     let role: ModelRole
     let downloadStrategy: DownloadStrategy
+    let artifactType: ArtifactType
     let tokenizerFiles: [String]
+    let configFiles: [String]
     let tokenizerRepoID: String?
+    let tokenizerFallbackRepoIDs: [String]
     let requiresAuth: Bool
     let isRecommended: Bool
     let isExperimental: Bool
@@ -61,6 +71,25 @@ nonisolated struct ModelSource: Sendable, Identifiable {
 
     var tokenizerFolderName: String { "\(id)-tokenizer" }
 
+    var allTokenizerRepoIDs: [String] {
+        var repos: [String] = []
+        if let primary = tokenizerRepoID {
+            repos.append(primary)
+        } else {
+            repos.append(repoID)
+        }
+        repos.append(contentsOf: tokenizerFallbackRepoIDs)
+        return repos
+    }
+
+    var formatLabel: String {
+        switch promptFormat {
+        case .llama3: "Llama"
+        case .qwen: "Qwen"
+        case .dolphin: "Dolphin"
+        }
+    }
+
     func hfResolveURL(path: String) -> URL? {
         URL(string: "https://huggingface.co/\(repoID)/resolve/main/\(path)")
     }
@@ -70,9 +99,9 @@ nonisolated struct ModelSource: Sendable, Identifiable {
         return URL(string: "https://huggingface.co/api/models/\(repoID)/tree/main/\(encoded)")
     }
 
-    func tokenizerFileURL(fileName: String) -> URL? {
-        let repo = tokenizerRepoID ?? repoID
-        return URL(string: "https://huggingface.co/\(repo)/resolve/main/\(fileName)")
+    func tokenizerFileURL(fileName: String, fromRepo repo: String? = nil) -> URL? {
+        let targetRepo = repo ?? tokenizerRepoID ?? repoID
+        return URL(string: "https://huggingface.co/\(targetRepo)/resolve/main/\(fileName)")
     }
 }
 
@@ -84,8 +113,11 @@ struct ModelSourceCatalog: Sendable {
             repoID: "finnvoorhees/coreml-Llama-3.2-3B-Instruct-4bit",
             role: .chat,
             downloadStrategy: .repoDirectory(modelPath: "Llama-3.2-3B-Instruct-4bit.mlmodelc"),
+            artifactType: .compiledModel,
             tokenizerFiles: ["tokenizer.json", "tokenizer_config.json"],
+            configFiles: [],
             tokenizerRepoID: nil,
+            tokenizerFallbackRepoIDs: [],
             requiresAuth: false,
             isRecommended: true,
             isExperimental: false,
@@ -101,8 +133,11 @@ struct ModelSourceCatalog: Sendable {
             repoID: "oceanicity/Qwen3-4B-Instruct-CoreML-8bit",
             role: .chat,
             downloadStrategy: .unsupported(reason: "Multi-chunk pipeline model. Requires pipeline inference support not yet implemented."),
+            artifactType: .compiledModel,
             tokenizerFiles: ["tokenizer.json", "tokenizer_config.json"],
+            configFiles: [],
             tokenizerRepoID: "Qwen/Qwen3-4B",
+            tokenizerFallbackRepoIDs: [],
             requiresAuth: false,
             isRecommended: false,
             isExperimental: true,
@@ -118,8 +153,11 @@ struct ModelSourceCatalog: Sendable {
             repoID: "finnvoorhees/coreml-Qwen2.5-3B-Instruct-4bit",
             role: .chat,
             downloadStrategy: .repoDirectory(modelPath: "Qwen2.5-3B-Instruct-4bit.mlmodelc"),
+            artifactType: .compiledModel,
             tokenizerFiles: ["tokenizer.json", "tokenizer_config.json"],
+            configFiles: [],
             tokenizerRepoID: nil,
+            tokenizerFallbackRepoIDs: [],
             requiresAuth: false,
             isRecommended: false,
             isExperimental: false,
@@ -135,8 +173,11 @@ struct ModelSourceCatalog: Sendable {
             repoID: "yacht/Llama-3.2-1B-Instruct-CoreML",
             role: .chat,
             downloadStrategy: .archive(filename: "model.mlmodelc.zip"),
+            artifactType: .zipArchive,
             tokenizerFiles: ["tokenizer.json", "tokenizer_config.json"],
+            configFiles: [],
             tokenizerRepoID: "meta-llama/Llama-3.2-1B-Instruct",
+            tokenizerFallbackRepoIDs: [],
             requiresAuth: false,
             isRecommended: false,
             isExperimental: false,
@@ -145,6 +186,29 @@ struct ModelSourceCatalog: Sendable {
             contextWindowTokens: 2048,
             promptFormat: .llama3,
             notes: "Lightweight fallback. Broader device compatibility."
+        ),
+        ModelSource(
+            id: "dolphin-3.0-coreml",
+            displayName: "Dolphin 3.0 CoreML",
+            repoID: "ales27pm/Dolphin3.0-CoreML",
+            role: .chat,
+            downloadStrategy: .repoDirectory(modelPath: "Dolphin3.0-Llama3.2-3B-int4-lut.mlpackage"),
+            artifactType: .mlpackageDirectory,
+            tokenizerFiles: ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"],
+            configFiles: ["config.json", "generation_config.json"],
+            tokenizerRepoID: nil,
+            tokenizerFallbackRepoIDs: [
+                "dphn/Dolphin3.0-Llama3.2-3B",
+                "meta-llama/Llama-3.2-3B"
+            ],
+            requiresAuth: false,
+            isRecommended: false,
+            isExperimental: true,
+            fallbackPriority: 4,
+            estimatedSizeBytes: 2_000_000_000,
+            contextWindowTokens: 4096,
+            promptFormat: .dolphin,
+            notes: "Dolphin 3.0 based on Llama 3.2 3B. Tokenizer may require fallback to upstream repos."
         ),
     ]
 
@@ -155,8 +219,11 @@ struct ModelSourceCatalog: Sendable {
             repoID: "NeoRoth/qwen3-embedding-0.6b-coreml",
             role: .embedding,
             downloadStrategy: .repoDirectory(modelPath: "encoder.mlmodelc"),
+            artifactType: .compiledModel,
             tokenizerFiles: ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"],
+            configFiles: [],
             tokenizerRepoID: nil,
+            tokenizerFallbackRepoIDs: [],
             requiresAuth: false,
             isRecommended: true,
             isExperimental: false,
@@ -172,8 +239,11 @@ struct ModelSourceCatalog: Sendable {
             repoID: "tooktang/Qwen3-Embedding-0.6B-CoreML",
             role: .embedding,
             downloadStrategy: .unsupported(reason: "Non-standard repository structure. Use the primary NeoRoth source."),
+            artifactType: .compiledModel,
             tokenizerFiles: ["tokenizer.json", "tokenizer_config.json"],
+            configFiles: [],
             tokenizerRepoID: "Qwen/Qwen3-Embedding-0.6B",
+            tokenizerFallbackRepoIDs: [],
             requiresAuth: false,
             isRecommended: false,
             isExperimental: true,
@@ -227,11 +297,17 @@ nonisolated enum ModelDownloadState: Sendable, Equatable {
     case downloading(progress: Double)
     case installing
     case installed
+    case installedMissingTokenizer
     case unavailable(String)
     case error(String)
 
     var isInstalled: Bool {
         if case .installed = self { return true }
+        return false
+    }
+
+    var isInstalledPartially: Bool {
+        if case .installedMissingTokenizer = self { return true }
         return false
     }
 
@@ -272,6 +348,7 @@ nonisolated enum ModelInstallError: Error, Sendable {
     case invalidArchive
     case modelNotFoundInArchive
     case tokenizerDownloadFailed(String)
+    case tokenizerGated(String)
     case validationFailed(String)
     case insufficientSpace
     case stagingCleanupFailed
@@ -279,6 +356,7 @@ nonisolated enum ModelInstallError: Error, Sendable {
     case preflightFailed(String)
     case hfTreeListFailed(String)
     case fileDownloadFailed(String)
+    case mlpackageInvalid(String)
 }
 
 nonisolated enum DownloadDiagnosticError: Error, Sendable {
@@ -293,7 +371,7 @@ nonisolated enum DownloadDiagnosticError: Error, Sendable {
     var userMessage: String {
         switch self {
         case .accessDenied(let url, let code):
-            "Access denied (HTTP \(code)). This model requires authentication on Hugging Face. URL: \(url)"
+            "Access denied (HTTP \(code)). This model may be gated and require authentication or license acceptance on Hugging Face. URL: \(url)"
         case .notFound(let url):
             "Model artifact not found (HTTP 404). The file may have been moved or removed. URL: \(url)"
         case .rateLimited(let url):
@@ -316,6 +394,7 @@ nonisolated enum InstallPhase: String, Sendable {
     case extracting
     case validating
     case installingTokenizer
+    case installingConfig
     case complete
 }
 
@@ -333,4 +412,11 @@ nonisolated struct HFFileEntry: Sendable {
     let path: String
     let size: Int64
     let type: String
+}
+
+nonisolated struct TokenizerFallbackResult: Sendable {
+    let resolvedRepo: String
+    let filesDownloaded: [String]
+    let filesMissing: [String]
+    let gatedRepos: [String]
 }

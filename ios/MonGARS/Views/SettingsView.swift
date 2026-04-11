@@ -67,7 +67,7 @@ struct SettingsView: View {
                             HStack(spacing: 8) {
                                 Text(source.estimatedSizeDescription)
                                 Text("•")
-                                Text(source.promptFormat == .llama3 ? "Llama" : "Qwen")
+                                Text(source.formatLabel)
                             }
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -151,6 +151,10 @@ struct SettingsView: View {
             Text(viewModel.localeManager.localizedString("Ready", "Pr\u{00EA}t"))
                 .font(.caption2)
                 .foregroundStyle(.green)
+        case .installedMissingTokenizer:
+            Text(viewModel.localeManager.localizedString("Missing Tokenizer", "Tokenizer manquant"))
+                .font(.caption2)
+                .foregroundStyle(.orange)
         case .downloading(let p):
             Text("\(Int(p * 100))%")
                 .font(.caption2)
@@ -378,6 +382,13 @@ struct SettingsView: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 2)
                 .background(.green.opacity(0.15), in: Capsule())
+        case .installedMissingTokenizer:
+            Text(viewModel.localeManager.localizedString("Missing Tokenizer", "Tokenizer manquant"))
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .background(.orange.opacity(0.15), in: Capsule())
         case .downloading(let progress):
             Text("\(Int(progress * 100))%")
                 .font(.caption)

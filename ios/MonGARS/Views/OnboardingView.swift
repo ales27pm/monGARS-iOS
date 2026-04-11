@@ -388,6 +388,21 @@ struct OnboardingView: View {
             )
             .foregroundStyle(.green)
             .font(.subheadline)
+        case .installedMissingTokenizer:
+            VStack(alignment: .leading, spacing: 4) {
+                Label(
+                    viewModel.localeManager.localizedString("Model installed — tokenizer missing", "Mod\u{00E8}le install\u{00E9} — tokenizer manquant"),
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .foregroundStyle(.orange)
+                .font(.caption.bold())
+                if let info = viewModel.tokenizerFallbackInfo {
+                    Text(info)
+                        .font(.caption2)
+                        .foregroundStyle(.orange.opacity(0.8))
+                        .lineLimit(4)
+                }
+            }
         case .unavailable:
             Label {
                 Text(viewModel.localeManager.localizedString("Not yet available", "Pas encore disponible"))

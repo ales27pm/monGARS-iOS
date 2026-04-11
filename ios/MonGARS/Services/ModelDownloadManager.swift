@@ -12,6 +12,7 @@ final class ModelDownloadManager {
     var currentInstallPhase: InstallPhase?
     var overallPhase: OverallInstallPhase?
     var lastDiagnosticMessage: String?
+    var lastTokenizerFallbackResult: TokenizerFallbackResult?
 
     private var activeTasks: [ModelSourceID: URLSessionDownloadTask] = [:]
     private var progressObservations: [ModelSourceID: NSKeyValueObservation] = [:]
@@ -36,8 +37,10 @@ final class ModelDownloadManager {
     var isChatReady: Bool { isLLMReady }
     var isSemanticMemoryReady: Bool { isEmbeddingReady }
 
+    var isLLMPartial: Bool { llmState.isInstalledPartially }
+
     var llmStorageUsed: String {
-        guard isLLMReady else { return "0 MB" }
+        guard isLLMReady || isLLMPartial else { return "0 MB" }
         return directorySizeString(at: modelDirectory(for: selectedChatSourceID))
     }
 
@@ -160,6 +163,10 @@ final class ModelDownloadManager {
             return modelDir
         }
         return nil
+    }
+
+    func hasTokenizer(for sourceID: ModelSourceID) -> Bool {
+        tokenizerDirectory(for: sourceID) != nil
     }
 
     var availableDiskSpaceBytes: Int64 {
@@ -294,7 +301,11 @@ final class ModelDownloadManager {
 
             currentInstallPhase = .installingTokenizer
             overallPhase = .tokenizerInstall
-            await downloadTokenizerFiles(source: source, to: destDir)
+            let tokResult = await downloadTokenizerWithFallback(source: source, to: destDir)
+            lastTokenizerFallbackResult = tokResult
+
+            currentInstallPhase = .installingConfig
+            await downloadConfigFiles(source: source, to: destDir)
 
             try validateInstall(modelDir: destDir, source: source)
             try excludeFromBackup(destDir)
@@ -303,7 +314,8 @@ final class ModelDownloadManager {
             try? fileManager.removeItem(at: archiveURL)
 
             currentInstallPhase = .complete
-            updateState(for: sourceID, state: .installed)
+            let hasTokenizer = tokResult.filesDownloaded.contains("tokenizer.json")
+            updateState(for: sourceID, state: hasTokenizer ? .installed : .installedMissingTokenizer)
             logger.info("Archive model installed: \(sourceID)")
         } catch {
             try? fileManager.removeItem(at: stagingDir)
@@ -328,6 +340,11 @@ final class ModelDownloadManager {
         lastDiagnosticMessage = "Listing files: \(treeURL.absoluteString)"
 
         do {
+            currentInstallPhase = .preflight
+
+            let preflightOK = await preflightCheckTree(treeURL: treeURL, sourceID: sourceID)
+            guard preflightOK else { return }
+
             let fileEntries = try await listHFDirectory(treeURL: treeURL)
             guard !fileEntries.isEmpty else {
                 updateState(for: sourceID, state: .error("No files found in model directory on HuggingFace"))
@@ -380,15 +397,25 @@ final class ModelDownloadManager {
 
             currentInstallPhase = .installingTokenizer
             overallPhase = source.isChat ? .tokenizerInstall : .tokenizerInstall
-            await downloadTokenizerFiles(source: source, to: destDir)
+            let tokResult = await downloadTokenizerWithFallback(source: source, to: destDir)
+            lastTokenizerFallbackResult = tokResult
+
+            currentInstallPhase = .installingConfig
+            await downloadConfigFiles(source: source, to: destDir)
 
             currentInstallPhase = .validating
             overallPhase = .validation
+
+            if source.artifactType == .mlpackageDirectory {
+                try validateMLPackageStructure(packageDir: modelArtifactDir)
+            }
+
             try validateInstall(modelDir: destDir, source: source)
             try excludeFromBackup(destDir)
 
             currentInstallPhase = .complete
-            updateState(for: sourceID, state: .installed)
+            let hasTokenizer = tokResult.filesDownloaded.contains("tokenizer.json")
+            updateState(for: sourceID, state: hasTokenizer ? .installed : .installedMissingTokenizer)
             logger.info("Repo directory model installed: \(sourceID)")
         } catch {
             let destDir = modelDirectory(for: sourceID)
@@ -398,6 +425,48 @@ final class ModelDownloadManager {
         }
 
         currentInstallPhase = nil
+    }
+
+    private func preflightCheckTree(treeURL: URL, sourceID: ModelSourceID) async -> Bool {
+        logger.info("Preflight tree: \(treeURL.absoluteString)")
+        lastDiagnosticMessage = "Verifying artifact: \(treeURL.absoluteString)"
+
+        do {
+            var request = URLRequest(url: treeURL)
+            request.httpMethod = "GET"
+            request.timeoutInterval = 15
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                updateState(for: sourceID, state: .error("Preflight: non-HTTP response"))
+                currentInstallPhase = nil
+                return false
+            }
+
+            let finalURL = http.url ?? treeURL
+
+            if (200...299).contains(http.statusCode) {
+                if let jsonArray = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]], !jsonArray.isEmpty {
+                    return true
+                }
+                updateState(for: sourceID, state: .error("Artifact directory is empty or invalid at \(finalURL.absoluteString)"))
+                currentInstallPhase = nil
+                return false
+            }
+
+            let bodyPreview = String(data: data.prefix(300), encoding: .utf8) ?? ""
+            let diagError = classifyHTTPError(statusCode: http.statusCode, url: finalURL.absoluteString, bodyPreview: bodyPreview)
+            updateState(for: sourceID, state: .error(diagError.userMessage))
+            lastDiagnosticMessage = diagError.userMessage
+            currentInstallPhase = nil
+            return false
+        } catch {
+            let msg = DownloadDiagnosticError.preflightUnreachable(url: treeURL.absoluteString, underlyingError: error.localizedDescription).userMessage
+            updateState(for: sourceID, state: .error(msg))
+            lastDiagnosticMessage = msg
+            currentInstallPhase = nil
+            return false
+        }
     }
 
     private func listHFDirectory(treeURL: URL) async throws -> [HFFileEntry] {
@@ -428,28 +497,161 @@ final class ModelDownloadManager {
         return entries
     }
 
-    // MARK: - Tokenizer
+    // MARK: - Tokenizer with Fallback Chain
 
-    private func downloadTokenizerFiles(source: ModelSource, to directory: URL) async {
-        for fileName in source.tokenizerFiles {
+    private func downloadTokenizerWithFallback(source: ModelSource, to directory: URL) async -> TokenizerFallbackResult {
+        let allRepos = source.allTokenizerRepoIDs
+        var filesDownloaded: [String] = []
+        var filesMissing: [String] = []
+        var gatedRepos: [String] = []
+        var resolvedRepo = allRepos.first ?? source.repoID
+
+        for repo in allRepos {
+            let result = await attemptTokenizerDownload(
+                files: source.tokenizerFiles,
+                fromRepo: repo,
+                to: directory,
+                alreadyDownloaded: filesDownloaded
+            )
+
+            filesDownloaded.append(contentsOf: result.downloaded)
+            gatedRepos.append(contentsOf: result.gated ? [repo] : [])
+
+            if result.downloaded.contains("tokenizer.json") {
+                resolvedRepo = repo
+                logger.info("Tokenizer resolved from repo: \(repo)")
+                break
+            }
+        }
+
+        for file in source.tokenizerFiles where !filesDownloaded.contains(file) {
+            filesMissing.append(file)
+        }
+
+        if !filesMissing.isEmpty {
+            logger.warning("Tokenizer files missing after fallback chain: \(filesMissing.joined(separator: ", "))")
+        }
+        if !gatedRepos.isEmpty {
+            logger.warning("Gated repos encountered during tokenizer fallback: \(gatedRepos.joined(separator: ", "))")
+        }
+
+        return TokenizerFallbackResult(
+            resolvedRepo: resolvedRepo,
+            filesDownloaded: filesDownloaded,
+            filesMissing: filesMissing,
+            gatedRepos: gatedRepos
+        )
+    }
+
+    private struct TokenizerAttemptResult {
+        let downloaded: [String]
+        let gated: Bool
+    }
+
+    private func attemptTokenizerDownload(files: [String], fromRepo repo: String, to directory: URL, alreadyDownloaded: [String]) async -> TokenizerAttemptResult {
+        var downloaded: [String] = []
+        var encounteredGate = false
+
+        for fileName in files {
+            if alreadyDownloaded.contains(fileName) { continue }
+
             let destFile = directory.appendingPathComponent(fileName)
-            if fileManager.fileExists(atPath: destFile.path) { continue }
+            if fileManager.fileExists(atPath: destFile.path) {
+                downloaded.append(fileName)
+                continue
+            }
 
-            guard let url = source.tokenizerFileURL(fileName: fileName) else { continue }
+            guard let url = URL(string: "https://huggingface.co/\(repo)/resolve/main/\(fileName)") else { continue }
 
             do {
                 let (data, response) = try await URLSession.shared.data(from: url)
-                guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
-                    let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-                    logger.warning("Tokenizer file \(fileName) not available (HTTP \(code))")
-                    continue
+                guard let httpResponse = response as? HTTPURLResponse else { continue }
+
+                if (200...299).contains(httpResponse.statusCode) {
+                    try data.write(to: destFile, options: .atomic)
+                    downloaded.append(fileName)
+                    logger.info("Downloaded tokenizer file \(fileName) from \(repo)")
+                } else if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                    encounteredGate = true
+                    logger.warning("Tokenizer file \(fileName) gated at \(repo) (HTTP \(httpResponse.statusCode))")
+                } else {
+                    logger.warning("Tokenizer file \(fileName) not available from \(repo) (HTTP \(httpResponse.statusCode))")
                 }
-                try data.write(to: destFile, options: .atomic)
-                logger.info("Downloaded tokenizer file: \(fileName)")
             } catch {
-                logger.warning("Failed to download tokenizer file \(fileName): \(error.localizedDescription)")
+                logger.warning("Failed to download tokenizer file \(fileName) from \(repo): \(error.localizedDescription)")
             }
         }
+
+        return TokenizerAttemptResult(downloaded: downloaded, gated: encounteredGate)
+    }
+
+    // MARK: - Config Files
+
+    private func downloadConfigFiles(source: ModelSource, to directory: URL) async {
+        guard !source.configFiles.isEmpty else { return }
+
+        let allRepos = source.allTokenizerRepoIDs
+
+        for fileName in source.configFiles {
+            let destFile = directory.appendingPathComponent(fileName)
+            if fileManager.fileExists(atPath: destFile.path) { continue }
+
+            var downloaded = false
+            for repo in allRepos {
+                guard let url = URL(string: "https://huggingface.co/\(repo)/resolve/main/\(fileName)") else { continue }
+
+                do {
+                    let (data, response) = try await URLSession.shared.data(from: url)
+                    guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else { continue }
+                    try data.write(to: destFile, options: .atomic)
+                    logger.info("Downloaded config file \(fileName) from \(repo)")
+                    downloaded = true
+                    break
+                } catch {
+                    continue
+                }
+            }
+
+            if !downloaded {
+                logger.info("Config file \(fileName) not found in any repo (non-critical)")
+            }
+        }
+    }
+
+    // MARK: - MLPackage Validation
+
+    private func validateMLPackageStructure(packageDir: URL) throws {
+        let manifestURL = packageDir.appendingPathComponent("Manifest.json")
+        guard fileManager.fileExists(atPath: manifestURL.path) else {
+            throw ModelInstallError.mlpackageInvalid("Missing Manifest.json in \(packageDir.lastPathComponent)")
+        }
+
+        let modelFileURL = packageDir
+            .appendingPathComponent("Data")
+            .appendingPathComponent("com.apple.CoreML")
+            .appendingPathComponent("model.mlmodel")
+
+        guard fileManager.fileExists(atPath: modelFileURL.path) else {
+            throw ModelInstallError.mlpackageInvalid("Missing Data/com.apple.CoreML/model.mlmodel in \(packageDir.lastPathComponent)")
+        }
+
+        let weightsDir = packageDir
+            .appendingPathComponent("Data")
+            .appendingPathComponent("com.apple.CoreML")
+            .appendingPathComponent("weights")
+
+        if fileManager.fileExists(atPath: weightsDir.path) {
+            let weightFiles = (try? fileManager.contentsOfDirectory(at: weightsDir, includingPropertiesForKeys: [.fileSizeKey])) ?? []
+            let hasWeights = weightFiles.contains { url in
+                let ext = url.pathExtension.lowercased()
+                return ext == "bin" || ext == "weight" || ext == "dat"
+            }
+            if !hasWeights && !weightFiles.isEmpty {
+                logger.info("Weights directory exists but no standard weight files found — may use alternative format")
+            }
+        }
+
+        logger.info("MLPackage structure validated: \(packageDir.lastPathComponent)")
     }
 
     // MARK: - Validation
@@ -531,7 +733,8 @@ final class ModelDownloadManager {
                 if fileManager.fileExists(atPath: dir.path) {
                     do {
                         try validateInstall(modelDir: dir, source: source)
-                        updateState(for: source.id, state: .installed)
+                        let hasTok = hasTokenizer(for: source.id)
+                        updateState(for: source.id, state: hasTok ? .installed : .installedMissingTokenizer)
                         continue
                     } catch {
                         // fall through
@@ -548,7 +751,8 @@ final class ModelDownloadManager {
 
             do {
                 try validateInstall(modelDir: dir, source: source)
-                updateState(for: source.id, state: .installed)
+                let hasTok = hasTokenizer(for: source.id)
+                updateState(for: source.id, state: hasTok ? .installed : .installedMissingTokenizer)
             } catch {
                 logger.warning("Existing model \(source.id) failed validation: \(error.localizedDescription)")
                 updateState(for: source.id, state: .notDownloaded)
@@ -569,7 +773,8 @@ final class ModelDownloadManager {
             if let src = ModelSourceCatalog.source(for: sourceID) {
                 do {
                     try validateInstall(modelDir: dir, source: src)
-                    return .installed
+                    let hasTok = hasTokenizer(for: sourceID)
+                    return hasTok ? .installed : .installedMissingTokenizer
                 } catch {
                     return .notDownloaded
                 }

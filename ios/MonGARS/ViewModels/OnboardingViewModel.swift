@@ -29,6 +29,10 @@ final class OnboardingViewModel {
         modelDownloadManager.isLLMReady
     }
 
+    var isLLMPartial: Bool {
+        modelDownloadManager.isLLMPartial
+    }
+
     var isEmbeddingDownloading: Bool {
         modelDownloadManager.embeddingState.isDownloading
     }
@@ -83,6 +87,25 @@ final class OnboardingViewModel {
         modelDownloadManager.selectedEmbeddingSource
     }
 
+    var tokenizerFallbackInfo: String? {
+        guard let result = modelDownloadManager.lastTokenizerFallbackResult else { return nil }
+        if !result.filesMissing.isEmpty {
+            let missing = result.filesMissing.joined(separator: ", ")
+            if !result.gatedRepos.isEmpty {
+                let gated = result.gatedRepos.joined(separator: ", ")
+                return localeManager.localizedString(
+                    "Tokenizer files missing: \(missing). Repos requiring auth: \(gated)",
+                    "Fichiers tokenizer manquants: \(missing). Dépôts nécessitant une authentification: \(gated)"
+                )
+            }
+            return localeManager.localizedString(
+                "Tokenizer files missing: \(missing). Chat model may not load correctly.",
+                "Fichiers tokenizer manquants: \(missing). Le modèle de conversation pourrait ne pas charger correctement."
+            )
+        }
+        return nil
+    }
+
     var installPhaseDescription: String? {
         guard let phase = modelDownloadManager.currentInstallPhase else { return nil }
         switch phase {
@@ -96,6 +119,8 @@ final class OnboardingViewModel {
             return localeManager.localizedString("Validating...", "Validation...")
         case .installingTokenizer:
             return localeManager.localizedString("Installing tokenizer...", "Installation du tokenizer...")
+        case .installingConfig:
+            return localeManager.localizedString("Installing config files...", "Installation des fichiers de config...")
         case .complete:
             return localeManager.localizedString("Complete", "Terminé")
         }
