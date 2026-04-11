@@ -195,7 +195,10 @@ final class AgentOrchestrator {
         }
 
         let args = (parsed["arguments"] as? [String: String]) ?? [:]
-        let requiresApproval = toolRegistry.requiresApproval(toolName: name)
+        let schemaRequiresApproval = toolRegistry.requiresApproval(toolName: name)
+        let isNetwork = toolRegistry.isNetworkRequired(toolName: name)
+        let forceApproval = isNetwork && networkPolicy.askBeforeNetworkUse
+        let requiresApproval = schemaRequiresApproval || forceApproval
 
         return ToolCallRequest(toolName: name, arguments: args, requiresApproval: requiresApproval)
     }

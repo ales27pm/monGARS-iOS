@@ -17,7 +17,6 @@ struct ContentView: View {
 
     private var hasCompletedOnboarding: Bool {
         SecureStoreService.syncExists(key: .onboardingCompleted)
-            || UserDefaults.standard.bool(forKey: "has_completed_onboarding")
     }
 
     var body: some View {
