@@ -94,9 +94,13 @@ nonisolated struct ModelSource: Sendable, Identifiable {
         URL(string: "https://huggingface.co/\(repoID)/resolve/main/\(path)")
     }
 
-    func hfTreeURL(path: String) -> URL? {
+    func hfTreeURL(path: String, recursive: Bool = true) -> URL? {
         let encoded = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
-        return URL(string: "https://huggingface.co/api/models/\(repoID)/tree/main/\(encoded)")
+        let base = "https://huggingface.co/api/models/\(repoID)/tree/main/\(encoded)"
+        if recursive {
+            return URL(string: base + "?recursive=true")
+        }
+        return URL(string: base)
     }
 
     func tokenizerFileURL(fileName: String, fromRepo repo: String? = nil) -> URL? {
@@ -176,8 +180,8 @@ struct ModelSourceCatalog: Sendable {
             artifactType: .zipArchive,
             tokenizerFiles: ["tokenizer.json", "tokenizer_config.json"],
             configFiles: [],
-            tokenizerRepoID: "meta-llama/Llama-3.2-1B-Instruct",
-            tokenizerFallbackRepoIDs: [],
+            tokenizerRepoID: "finnvoorhees/coreml-Llama-3.2-3B-Instruct-4bit",
+            tokenizerFallbackRepoIDs: ["yacht/Llama-3.2-1B-Instruct-CoreML"],
             requiresAuth: false,
             isRecommended: false,
             isExperimental: false,

@@ -382,14 +382,9 @@ final class ModelDownloadManager {
                     try fileManager.createDirectory(at: localDir, withIntermediateDirectories: true)
                 }
 
-                let (data, response) = try await URLSession.shared.data(from: fileURL)
-                if let http = response as? HTTPURLResponse, !(200...399).contains(http.statusCode) {
-                    let diagError = classifyHTTPError(statusCode: http.statusCode, url: fileURL.absoluteString, bodyPreview: "")
-                    throw ModelInstallError.fileDownloadFailed(diagError.userMessage)
-                }
-
-                try data.write(to: localFile, options: .atomic)
-                downloadedBytes += Int64(data.count)
+                try await downloadFileStreaming(from: fileURL, to: localFile)
+                let fileSize = (try? localFile.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                downloadedBytes += Int64(fileSize)
 
                 let progress = totalBytes > 0 ? Double(downloadedBytes) / Double(totalBytes) : 0
                 updateState(for: sourceID, state: .downloading(progress: min(progress, 0.99)))
@@ -470,11 +465,20 @@ final class ModelDownloadManager {
     }
 
     private func listHFDirectory(treeURL: URL) async throws -> [HFFileEntry] {
-        let (data, response) = try await URLSession.shared.data(from: treeURL)
+        let recursiveURL: URL
+        if treeURL.absoluteString.contains("recursive=true") {
+            recursiveURL = treeURL
+        } else {
+            let separator = treeURL.absoluteString.contains("?") ? "&" : "?"
+            recursiveURL = URL(string: treeURL.absoluteString + separator + "recursive=true") ?? treeURL
+        }
+
+        logger.info("Listing HF directory (recursive): \(recursiveURL.absoluteString)")
+        let (data, response) = try await URLSession.shared.data(from: recursiveURL)
 
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            throw ModelInstallError.hfTreeListFailed("HTTP \(code) from \(treeURL.absoluteString)")
+            throw ModelInstallError.hfTreeListFailed("HTTP \(code) from \(recursiveURL.absoluteString)")
         }
 
         guard let jsonArray = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
@@ -487,9 +491,9 @@ final class ModelDownloadManager {
                   let path = item["path"] as? String else { continue }
 
             if type == "file" {
-                let size = (item["size"] as? Int64)
-                    ?? (item["lfs"] as? [String: Any])?["size"] as? Int64
-                    ?? 0
+                let lfsSize = (item["lfs"] as? [String: Any])?["size"] as? Int64
+                let directSize = item["size"] as? Int64
+                let size = lfsSize ?? directSize ?? 0
                 entries.append(HFFileEntry(path: path, size: size, type: type))
             }
         }
@@ -795,6 +799,22 @@ final class ModelDownloadManager {
         } else if source.isEmbedding {
             embeddingState = state
         }
+    }
+
+    // MARK: - Streaming File Download
+
+    private func downloadFileStreaming(from url: URL, to localFile: URL) async throws {
+        let (tempURL, response) = try await URLSession.shared.download(from: url)
+        if let http = response as? HTTPURLResponse, !(200...399).contains(http.statusCode) {
+            let bodyPreview = readBodyPreview(from: tempURL)
+            try? fileManager.removeItem(at: tempURL)
+            let diagError = classifyHTTPError(statusCode: http.statusCode, url: url.absoluteString, bodyPreview: bodyPreview)
+            throw ModelInstallError.fileDownloadFailed(diagError.userMessage)
+        }
+        if fileManager.fileExists(atPath: localFile.path) {
+            try fileManager.removeItem(at: localFile)
+        }
+        try fileManager.moveItem(at: tempURL, to: localFile)
     }
 
     // MARK: - Utilities
