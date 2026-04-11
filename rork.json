@@ -2,7 +2,7 @@
   "$schema": "https://rork.com/schema/rork.json",
   "apps": [
     {
-      "name": "Mon GARS",
+      "name": "monGARS",
       "path": "ios",
       "framework": "swift"
     }
