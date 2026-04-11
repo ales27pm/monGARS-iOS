@@ -240,12 +240,24 @@ struct OnboardingView: View {
                         Button {
                             viewModel.startDownload()
                         } label: {
-                            Text(viewModel.localeManager.localizedString("Download Models", "T\u{00E9}l\u{00E9}charger les mod\u{00E8}les"))
+                            Text(viewModel.localeManager.localizedString("Download Chat Model", "T\u{00E9}l\u{00E9}charger le mod\u{00E8}le de conversation"))
                                 .font(.headline)
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.large)
+                    }
+
+                    if viewModel.isChatReady && !viewModel.isEmbeddingReady && !viewModel.isEmbeddingUnavailable && !viewModel.isEmbeddingDownloading && !viewModel.isEmbeddingInstalling {
+                        Button {
+                            viewModel.startEmbeddingDownload()
+                        } label: {
+                            Text(viewModel.localeManager.localizedString("Download Embedding Model (Optional)", "T\u{00E9}l\u{00E9}charger le mod\u{00E8}le d'embeddings (Optionnel)"))
+                                .font(.subheadline)
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
                     }
 
                     Button {
@@ -268,16 +280,30 @@ struct OnboardingView: View {
         VStack(spacing: 12) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(viewModel.modelDownloadManager.selectedLLMVariant.displayName)
+                    Text(viewModel.selectedChatSource?.displayName ?? "Chat Model")
                         .font(.subheadline.bold())
                     Text(viewModel.localeManager.localizedString("Conversation", "Conversation"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text(viewModel.modelDownloadManager.selectedLLMVariant.estimatedSizeDescription)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if let source = viewModel.selectedChatSource {
+                    Text(source.estimatedSizeDescription)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let badge = viewModel.selectedChatSource?.badgeLabel {
+                HStack {
+                    Text(badge)
+                        .font(.caption2.bold())
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 2)
+                        .background(viewModel.selectedChatSource?.isExperimental == true ? Color.orange : Color.blue, in: Capsule())
+                    Spacer()
+                }
             }
 
             modelStateView(
@@ -295,16 +321,18 @@ struct OnboardingView: View {
         VStack(spacing: 12) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(ModelVariant.graniteEmbedding.displayName)
+                    Text(viewModel.selectedEmbeddingSource?.displayName ?? "Embedding Model")
                         .font(.subheadline.bold())
                     Text(viewModel.localeManager.localizedString("Semantic Memory / Recall", "M\u{00E9}moire s\u{00E9}mantique / Rappel"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text(ModelVariant.graniteEmbedding.estimatedSizeDescription)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if let source = viewModel.selectedEmbeddingSource {
+                    Text(source.estimatedSizeDescription)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             modelStateView(
@@ -318,8 +346,8 @@ struct OnboardingView: View {
                     Image(systemName: "info.circle")
                         .font(.caption)
                     Text(viewModel.localeManager.localizedString(
-                        "Semantic memory will be available once a CoreML embedding model is configured.",
-                        "La m\u{00E9}moire s\u{00E9}mantique sera disponible d\u{00E8}s qu'un mod\u{00E8}le d'embeddings CoreML sera configur\u{00E9}."
+                        "Semantic memory is optional. Chat works without it.",
+                        "La m\u{00E9}moire s\u{00E9}mantique est optionnelle. Le clavardage fonctionne sans."
                     ))
                     .font(.caption2)
                 }
@@ -360,7 +388,7 @@ struct OnboardingView: View {
             )
             .foregroundStyle(.green)
             .font(.subheadline)
-        case .unavailable(let reason):
+        case .unavailable:
             Label {
                 Text(viewModel.localeManager.localizedString("Not yet available", "Pas encore disponible"))
                     .font(.caption)
@@ -396,8 +424,8 @@ struct OnboardingView: View {
 
                 if viewModel.isChatReady && !viewModel.isEmbeddingReady {
                     Text(viewModel.localeManager.localizedString(
-                        "Chat is ready. Semantic memory will be available once the embedding model is installed.",
-                        "Le clavardage est pr\u{00EA}t. La m\u{00E9}moire s\u{00E9}mantique sera disponible une fois le mod\u{00E8}le d'embeddings install\u{00E9}."
+                        "Chat is ready. Semantic memory will be available once the embedding model is installed from Settings.",
+                        "Le clavardage est pr\u{00EA}t. La m\u{00E9}moire s\u{00E9}mantique sera disponible une fois le mod\u{00E8}le d'embeddings install\u{00E9} depuis les R\u{00E9}glages."
                     ))
                     .font(.body)
                     .foregroundStyle(.secondary)

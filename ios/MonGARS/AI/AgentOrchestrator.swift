@@ -8,44 +8,27 @@ final class AgentOrchestrator {
     let localeManager: LocaleManager
     let memoryService: SemanticMemoryService?
     let networkPolicy: NetworkPolicyService
+    let promptFormat: PromptFormat
 
     var pendingToolCall: ToolCallRequest?
     var isProcessing: Bool = false
 
-    init(llmEngine: LLMEngine, toolRegistry: ToolRegistry, localeManager: LocaleManager, networkPolicy: NetworkPolicyService, memoryService: SemanticMemoryService? = nil) {
+    init(llmEngine: LLMEngine, toolRegistry: ToolRegistry, localeManager: LocaleManager, networkPolicy: NetworkPolicyService, promptFormat: PromptFormat = .llama3, memoryService: SemanticMemoryService? = nil) {
         self.llmEngine = llmEngine
         self.toolRegistry = toolRegistry
         self.localeManager = localeManager
         self.networkPolicy = networkPolicy
+        self.promptFormat = promptFormat
         self.memoryService = memoryService
     }
 
     func compilePrompt(messages: [Message], language: AppLanguage, retrievedContext: String? = nil) -> String {
-        var prompt = "<|begin_of_text|>"
-
-        prompt += "<|start_header_id|>system<|end_header_id|>\n\n"
-        prompt += systemPrompt(for: language)
-
-        if let context = retrievedContext {
-            prompt += "\n\n" + context
+        switch promptFormat {
+        case .llama3:
+            return compileLlama3Prompt(messages: messages, language: language, retrievedContext: retrievedContext)
+        case .qwen:
+            return compileQwenPrompt(messages: messages, language: language, retrievedContext: retrievedContext)
         }
-
-        prompt += "<|eot_id|>"
-
-        let recentMessages = Array(messages.suffix(20))
-
-        for message in recentMessages {
-            let role = message.messageRole
-            guard role == .user || role == .assistant else { continue }
-
-            prompt += "<|start_header_id|>\(role.rawValue)<|end_header_id|>\n\n"
-            prompt += message.content
-            prompt += "<|eot_id|>"
-        }
-
-        prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n"
-
-        return prompt
     }
 
     func generateResponse(messages: [Message], language: AppLanguage, conversationId: String? = nil, config: GenerationConfig = .default) -> AsyncThrowingStream<String, Error> {
@@ -76,12 +59,19 @@ final class AgentOrchestrator {
                 )
 
                 var fullResponse = ""
+                let stopSequences = stopTokenSequences
 
                 do {
                     for try await token in stream {
-                        if token.contains("<|eot_id|>") || token.contains("<|end_of_text|>") {
-                            break
+                        var shouldStop = false
+                        for seq in stopSequences {
+                            if token.contains(seq) {
+                                shouldStop = true
+                                break
+                            }
                         }
+                        if shouldStop { break }
+
                         fullResponse += token
                         continuation.yield(token)
                     }
@@ -128,6 +118,77 @@ final class AgentOrchestrator {
     func denyToolCall() {
         pendingToolCall = nil
     }
+
+    // MARK: - Stop Sequences
+
+    private var stopTokenSequences: [String] {
+        switch promptFormat {
+        case .llama3:
+            ["<|eot_id|>", "<|end_of_text|>"]
+        case .qwen:
+            ["<|im_end|>", "<|endoftext|>"]
+        }
+    }
+
+    // MARK: - Llama 3 Prompt Format
+
+    private func compileLlama3Prompt(messages: [Message], language: AppLanguage, retrievedContext: String?) -> String {
+        var prompt = "<|begin_of_text|>"
+
+        prompt += "<|start_header_id|>system<|end_header_id|>\n\n"
+        prompt += systemPrompt(for: language)
+
+        if let context = retrievedContext {
+            prompt += "\n\n" + context
+        }
+
+        prompt += "<|eot_id|>"
+
+        let recentMessages = Array(messages.suffix(20))
+
+        for message in recentMessages {
+            let role = message.messageRole
+            guard role == .user || role == .assistant else { continue }
+
+            prompt += "<|start_header_id|>\(role.rawValue)<|end_header_id|>\n\n"
+            prompt += message.content
+            prompt += "<|eot_id|>"
+        }
+
+        prompt += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+
+        return prompt
+    }
+
+    // MARK: - Qwen Prompt Format
+
+    private func compileQwenPrompt(messages: [Message], language: AppLanguage, retrievedContext: String?) -> String {
+        var prompt = "<|im_start|>system\n"
+        prompt += systemPrompt(for: language)
+
+        if let context = retrievedContext {
+            prompt += "\n\n" + context
+        }
+
+        prompt += "<|im_end|>\n"
+
+        let recentMessages = Array(messages.suffix(20))
+
+        for message in recentMessages {
+            let role = message.messageRole
+            guard role == .user || role == .assistant else { continue }
+
+            prompt += "<|im_start|>\(role.rawValue)\n"
+            prompt += message.content
+            prompt += "<|im_end|>\n"
+        }
+
+        prompt += "<|im_start|>assistant\n"
+
+        return prompt
+    }
+
+    // MARK: - System Prompt
 
     private func systemPrompt(for language: AppLanguage) -> String {
         let toolDescriptions = toolRegistry.availableToolDescriptions(policy: networkPolicy)
@@ -177,6 +238,8 @@ final class AgentOrchestrator {
 
         return base + "\n\nAvailable tools:\n" + toolDescriptions
     }
+
+    // MARK: - Tool Parsing
 
     private func parseToolCall(from response: String) -> ToolCallRequest? {
         guard response.contains("<tool_call>") else { return nil }

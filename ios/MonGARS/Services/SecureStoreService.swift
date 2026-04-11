@@ -3,6 +3,7 @@ import Security
 
 nonisolated enum SecureStoreKey: String, Sendable {
     case selectedModelVariant = "selected_model_variant"
+    case selectedEmbeddingSource = "selected_embedding_source"
     case lastUsedLanguage = "last_used_language"
     case onboardingCompleted = "onboarding_completed"
     case modelDownloadToken = "model_download_token"

@@ -116,6 +116,7 @@ struct ContentView: View {
                 toolRegistry: toolRegistry,
                 localeManager: localeManager,
                 networkPolicy: networkPolicy,
+                promptFormat: coordinator.activePromptFormat,
                 memoryService: memoryService
             )
 

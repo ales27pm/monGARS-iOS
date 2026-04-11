@@ -13,9 +13,18 @@ struct MonGARSApp: App {
 
     init() {
         var manager = ModelDownloadManager()
-        if let storedVariant = SecureStoreService.syncLoad(key: .selectedModelVariant),
-           let variant = ModelVariant(rawValue: storedVariant) {
-            manager.selectedLLMVariant = variant
+        if let storedID = SecureStoreService.syncLoad(key: .selectedModelVariant) {
+            if ModelSourceCatalog.chatSource(for: storedID) != nil {
+                manager.selectedChatSourceID = storedID
+            } else if let migrated = ModelSourceCatalog.migrateOldVariant(storedID),
+                      ModelSourceCatalog.chatSource(for: migrated) != nil {
+                manager.selectedChatSourceID = migrated
+            }
+        }
+        if let storedEmbedID = SecureStoreService.syncLoad(key: .selectedEmbeddingSource) {
+            if ModelSourceCatalog.embeddingSource(for: storedEmbedID) != nil {
+                manager.selectedEmbeddingSourceID = storedEmbedID
+            }
         }
         _modelDownloadManager = State(initialValue: manager)
     }

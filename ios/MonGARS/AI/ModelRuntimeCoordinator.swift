@@ -35,8 +35,13 @@ final class ModelRuntimeCoordinator {
         setupSystemMonitoring()
     }
 
+    var activePromptFormat: PromptFormat {
+        let sourceID = modelDownloadManager.selectedChatSourceID
+        return ModelSourceCatalog.chatSource(for: sourceID)?.promptFormat ?? .llama3
+    }
+
     func loadLLMIfAvailable() async {
-        let variant = modelDownloadManager.selectedLLMVariant
+        let sourceID = modelDownloadManager.selectedChatSourceID
         guard modelDownloadManager.llmState.isDownloaded else {
             runtimeState = .degraded("LLM model not downloaded")
             return
@@ -44,17 +49,20 @@ final class ModelRuntimeCoordinator {
 
         runtimeState = .loadingLLM
 
-        guard let modelURL = modelDownloadManager.modelFileURL(for: variant) else {
+        guard let modelURL = modelDownloadManager.modelFileURL(for: sourceID) else {
             runtimeState = .error("Model files not found on disk")
             llmReady = false
             return
         }
 
-        let tokenizerDir = modelDownloadManager.tokenizerDirectory(for: variant)
-            ?? modelDownloadManager.modelDirectory(for: variant)
+        let source = ModelSourceCatalog.chatSource(for: sourceID)
+        let contextWindow = source?.contextWindowTokens ?? 2048
+
+        let tokenizerDir = modelDownloadManager.tokenizerDirectory(for: sourceID)
+            ?? modelDownloadManager.modelDirectory(for: sourceID)
 
         do {
-            try await llmEngine.loadModel(variant: variant, modelURL: modelURL, tokenizerDirectory: tokenizerDir)
+            try await llmEngine.loadModel(sourceID: sourceID, modelURL: modelURL, tokenizerDirectory: tokenizerDir, contextWindow: contextWindow)
             await llmEngine.warmup()
             llmReady = await llmEngine.isReady
             updateRuntimeState()
@@ -66,20 +74,23 @@ final class ModelRuntimeCoordinator {
     }
 
     func loadEmbeddingIfAvailable() async {
+        let sourceID = modelDownloadManager.selectedEmbeddingSourceID
         guard modelDownloadManager.embeddingState.isDownloaded else { return }
 
         runtimeState = .loadingEmbedding
 
-        guard let modelURL = modelDownloadManager.modelFileURL(for: .graniteEmbedding) else {
+        guard let modelURL = modelDownloadManager.modelFileURL(for: sourceID) else {
             embeddingReady = false
             updateRuntimeState()
             return
         }
 
-        let tokenizerDir = modelDownloadManager.tokenizerDirectory(for: .graniteEmbedding)
+        let source = ModelSourceCatalog.embeddingSource(for: sourceID)
+        let contextWindow = source?.contextWindowTokens ?? 512
+        let tokenizerDir = modelDownloadManager.tokenizerDirectory(for: sourceID)
 
         do {
-            try await embeddingEngine.loadModel(modelURL: modelURL, tokenizerDirectory: tokenizerDir)
+            try await embeddingEngine.loadModel(sourceID: sourceID, modelURL: modelURL, tokenizerDirectory: tokenizerDir, contextWindow: contextWindow)
             embeddingReady = await embeddingEngine.isReady
             updateRuntimeState()
         } catch {
@@ -103,15 +114,17 @@ final class ModelRuntimeCoordinator {
     }
 
     func attemptFallback() async {
-        let currentVariant = modelDownloadManager.selectedLLMVariant
-        guard currentVariant == .llama3B else {
+        let fallbackID = ModelSourceCatalog.fallbackChatSourceID
+        let currentID = modelDownloadManager.selectedChatSourceID
+
+        guard currentID != fallbackID else {
             runtimeState = .error("No fallback model available")
             return
         }
 
-        logger.info("Attempting fallback to 1B model")
+        logger.info("Attempting fallback to \(fallbackID)")
 
-        let fallbackDir = modelDownloadManager.modelDirectory(for: .llama1B)
+        let fallbackDir = modelDownloadManager.modelDirectory(for: fallbackID)
         guard FileManager.default.fileExists(atPath: fallbackDir.path) else {
             runtimeState = .error("Fallback model not available on disk")
             return
@@ -120,15 +133,17 @@ final class ModelRuntimeCoordinator {
         await llmEngine.unloadModel()
 
         do {
-            guard let modelURL = modelDownloadManager.modelFileURL(for: .llama1B) else {
+            guard let modelURL = modelDownloadManager.modelFileURL(for: fallbackID) else {
                 runtimeState = .error("Fallback model files missing")
                 return
             }
-            let tokenizerDir = modelDownloadManager.tokenizerDirectory(for: .llama1B) ?? fallbackDir
-            try await llmEngine.loadModel(variant: .llama1B, modelURL: modelURL, tokenizerDirectory: tokenizerDir)
+            let source = ModelSourceCatalog.chatSource(for: fallbackID)
+            let contextWindow = source?.contextWindowTokens ?? 2048
+            let tokenizerDir = modelDownloadManager.tokenizerDirectory(for: fallbackID) ?? fallbackDir
+            try await llmEngine.loadModel(sourceID: fallbackID, modelURL: modelURL, tokenizerDirectory: tokenizerDir, contextWindow: contextWindow)
             await llmEngine.warmup()
             llmReady = await llmEngine.isReady
-            runtimeState = .degraded("Running fallback 1B model")
+            runtimeState = .degraded("Running fallback model")
         } catch {
             runtimeState = .error("Fallback load failed: \(error.localizedDescription)")
             llmReady = false

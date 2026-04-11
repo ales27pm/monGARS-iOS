@@ -18,6 +18,8 @@ actor EmbeddingEngine {
     private var tokenizer: TokenizerService?
     private var engineState: EmbeddingEngineState = .unloaded
     private var dimensionCount: Int = 0
+    private var currentSourceID: ModelSourceID?
+    private var maxContextTokens: Int = 512
 
     init(diagnostics: InferenceDiagnostics) {
         self.diagnostics = diagnostics
@@ -27,7 +29,7 @@ actor EmbeddingEngine {
     var isReady: Bool { engineState == .ready }
     var dimensions: Int { dimensionCount }
 
-    func loadModel(modelURL: URL, tokenizerDirectory: URL?) async throws {
+    func loadModel(sourceID: ModelSourceID, modelURL: URL, tokenizerDirectory: URL?, contextWindow: Int) async throws {
         guard engineState != .loading else { return }
         engineState = .loading
 
@@ -56,6 +58,8 @@ actor EmbeddingEngine {
 
             let loadedModel = try await MLModel.load(contentsOf: compiledURL, configuration: config)
             self.model = loadedModel
+            self.currentSourceID = sourceID
+            self.maxContextTokens = contextWindow
 
             if let outputDesc = loadedModel.modelDescription.outputDescriptionsByName["embedding"],
                let shape = outputDesc.multiArrayConstraint?.shape {
@@ -65,11 +69,11 @@ actor EmbeddingEngine {
             engineState = .ready
 
             let loadDuration = CFAbsoluteTimeGetCurrent() - loadStart
-            await diagnostics.recordModelLoad(variant: .graniteEmbedding, durationSeconds: loadDuration, success: true)
+            await diagnostics.recordModelLoad(sourceID: sourceID, durationSeconds: loadDuration, success: true)
         } catch {
             let loadDuration = CFAbsoluteTimeGetCurrent() - loadStart
             engineState = .error("Embedding model loading failed: \(error.localizedDescription)")
-            await diagnostics.recordModelLoad(variant: .graniteEmbedding, durationSeconds: loadDuration, success: false)
+            await diagnostics.recordModelLoad(sourceID: sourceID, durationSeconds: loadDuration, success: false)
             throw error
         }
     }
@@ -85,8 +89,7 @@ actor EmbeddingEngine {
         if let tokenizer {
             let tokens = await tokenizer.encode(text)
             inputTokenCount = tokens.count
-            let maxLen = ModelVariant.graniteEmbedding.contextWindowTokens
-            let truncated = Array(tokens.prefix(maxLen))
+            let truncated = Array(tokens.prefix(maxContextTokens))
 
             let inputArray = try MLMultiArray(shape: [1, NSNumber(value: truncated.count)], dataType: .int32)
             for (i, token) in truncated.enumerated() {
@@ -173,6 +176,8 @@ actor EmbeddingEngine {
         model = nil
         tokenizer = nil
         dimensionCount = 0
+        currentSourceID = nil
+        maxContextTokens = 512
         engineState = .unloaded
         logger.info("Embedding engine unloaded")
     }

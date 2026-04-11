@@ -1,34 +1,42 @@
 import Foundation
 
-nonisolated enum ModelVariant: String, Codable, Sendable, CaseIterable, Identifiable {
-    case llama1B = "llama-3.2-1b-instruct"
-    case llama3B = "llama-3.2-3b-instruct"
-    case graniteEmbedding = "granite-embedding-278m"
+typealias ModelSourceID = String
 
-    nonisolated var id: String { rawValue }
+nonisolated enum ModelRole: String, Sendable {
+    case chat
+    case embedding
+}
 
-    var displayName: String {
-        switch self {
-        case .llama1B: "Llama 3.2 1B Instruct"
-        case .llama3B: "Llama 3.2 3B Instruct"
-        case .graniteEmbedding: "Granite Embedding 278M"
-        }
-    }
+nonisolated enum PromptFormat: String, Sendable {
+    case llama3
+    case qwen
+}
 
-    var shortDescription: String {
-        switch self {
-        case .llama1B, .llama3B: "Language Model"
-        case .graniteEmbedding: "Semantic Memory"
-        }
-    }
+nonisolated enum DownloadStrategy: Sendable {
+    case archive(filename: String)
+    case repoDirectory(modelPath: String)
+    case unsupported(reason: String)
+}
 
-    var estimatedSizeBytes: Int64 {
-        switch self {
-        case .llama1B: 1_300_000_000
-        case .llama3B: 3_600_000_000
-        case .graniteEmbedding: 560_000_000
-        }
-    }
+nonisolated struct ModelSource: Sendable, Identifiable {
+    let id: ModelSourceID
+    let displayName: String
+    let repoID: String
+    let role: ModelRole
+    let downloadStrategy: DownloadStrategy
+    let tokenizerFiles: [String]
+    let tokenizerRepoID: String?
+    let requiresAuth: Bool
+    let isRecommended: Bool
+    let isExperimental: Bool
+    let fallbackPriority: Int
+    let estimatedSizeBytes: Int64
+    let contextWindowTokens: Int
+    let promptFormat: PromptFormat
+    let notes: String?
+
+    var isChat: Bool { role == .chat }
+    var isEmbedding: Bool { role == .embedding }
 
     var estimatedSizeDescription: String {
         let formatter = ByteCountFormatter()
@@ -36,92 +44,181 @@ nonisolated enum ModelVariant: String, Codable, Sendable, CaseIterable, Identifi
         return formatter.string(fromByteCount: estimatedSizeBytes)
     }
 
-    var isLanguageModel: Bool {
-        switch self {
-        case .llama1B, .llama3B: true
-        case .graniteEmbedding: false
+    var isAvailableForDownload: Bool {
+        switch downloadStrategy {
+        case .unsupported: false
+        default: true
         }
     }
 
-    var isEmbeddingModel: Bool {
-        self == .graniteEmbedding
+    var badgeLabel: String? {
+        if isRecommended { return "Recommended" }
+        if isExperimental { return "Experimental" }
+        return nil
     }
 
-    var contextWindowTokens: Int {
-        switch self {
-        case .llama1B: 2048
-        case .llama3B: 4096
-        case .graniteEmbedding: 512
-        }
+    var modelDirectoryName: String { id }
+
+    var tokenizerFolderName: String { "\(id)-tokenizer" }
+
+    func hfResolveURL(path: String) -> URL? {
+        URL(string: "https://huggingface.co/\(repoID)/resolve/main/\(path)")
     }
 
-    var modelFileName: String {
-        "\(rawValue).mlmodelc"
+    func hfTreeURL(path: String) -> URL? {
+        let encoded = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
+        return URL(string: "https://huggingface.co/api/models/\(repoID)/tree/main/\(encoded)")
     }
 
-    var tokenizerFolderName: String {
-        "\(rawValue)-tokenizer"
-    }
-
-    var tokenizerFiles: [String] {
-        ["tokenizer.json", "tokenizer_config.json"]
+    func tokenizerFileURL(fileName: String) -> URL? {
+        let repo = tokenizerRepoID ?? repoID
+        return URL(string: "https://huggingface.co/\(repo)/resolve/main/\(fileName)")
     }
 }
 
-nonisolated struct ModelManifestEntry: Codable, Sendable {
-    let variant: String
-    let archiveURL: String
-    let archiveFileName: String
-    let tokenizerBaseURL: String
-    let requiresAuth: Bool
-    let notes: String?
-}
-
-nonisolated struct ModelManifest: Sendable {
-    static let entries: [ModelVariant: ModelManifestEntry] = [
-        .llama1B: ModelManifestEntry(
-            variant: "llama-3.2-1b-instruct",
-            archiveURL: "https://huggingface.co/yacht/Llama-3.2-1B-Instruct-CoreML/resolve/main/model.mlpackage.zip",
-            archiveFileName: "model.mlpackage.zip",
-            tokenizerBaseURL: "https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct/resolve/main",
+struct ModelSourceCatalog: Sendable {
+    static let chatSources: [ModelSource] = [
+        ModelSource(
+            id: "llama-3.2-3b-4bit",
+            displayName: "Llama 3.2 3B Instruct",
+            repoID: "finnvoorhees/coreml-Llama-3.2-3B-Instruct-4bit",
+            role: .chat,
+            downloadStrategy: .repoDirectory(modelPath: "Llama-3.2-3B-Instruct-4bit.mlmodelc"),
+            tokenizerFiles: ["tokenizer.json", "tokenizer_config.json"],
+            tokenizerRepoID: nil,
             requiresAuth: false,
-            notes: "Community CoreML conversion, anonymous download"
+            isRecommended: true,
+            isExperimental: false,
+            fallbackPriority: 2,
+            estimatedSizeBytes: 1_800_000_000,
+            contextWindowTokens: 4096,
+            promptFormat: .llama3,
+            notes: "4-bit quantized CoreML conversion by finnvoorhees"
         ),
-        .llama3B: ModelManifestEntry(
-            variant: "llama-3.2-3b-instruct",
-            archiveURL: "https://huggingface.co/yacht/Llama-3.2-3B-Instruct-CoreML/resolve/main/model.mlpackage.zip",
-            archiveFileName: "model.mlpackage.zip",
-            tokenizerBaseURL: "https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct/resolve/main",
+        ModelSource(
+            id: "qwen3-4b-8bit",
+            displayName: "Qwen3 4B Instruct",
+            repoID: "oceanicity/Qwen3-4B-Instruct-CoreML-8bit",
+            role: .chat,
+            downloadStrategy: .unsupported(reason: "Multi-chunk pipeline model. Requires pipeline inference support not yet implemented."),
+            tokenizerFiles: ["tokenizer.json", "tokenizer_config.json"],
+            tokenizerRepoID: "Qwen/Qwen3-4B",
             requiresAuth: false,
-            notes: "Community CoreML conversion, anonymous download"
+            isRecommended: false,
+            isExperimental: true,
+            fallbackPriority: 99,
+            estimatedSizeBytes: 4_500_000_000,
+            contextWindowTokens: 4096,
+            promptFormat: .qwen,
+            notes: "8-bit multi-chunk pipeline. Not yet supported by single-model inference engine."
         ),
-        .graniteEmbedding: ModelManifestEntry(
-            variant: "granite-embedding-278m",
-            archiveURL: "",
-            archiveFileName: "",
-            tokenizerBaseURL: "https://huggingface.co/ibm-granite/granite-embedding-278m-multilingual/resolve/main",
+        ModelSource(
+            id: "qwen2.5-3b-4bit",
+            displayName: "Qwen 2.5 3B Instruct",
+            repoID: "finnvoorhees/coreml-Qwen2.5-3B-Instruct-4bit",
+            role: .chat,
+            downloadStrategy: .repoDirectory(modelPath: "Qwen2.5-3B-Instruct-4bit.mlmodelc"),
+            tokenizerFiles: ["tokenizer.json", "tokenizer_config.json"],
+            tokenizerRepoID: nil,
             requiresAuth: false,
-            notes: "No CoreML conversion available yet. Embedding model requires manual conversion from safetensors."
-        )
+            isRecommended: false,
+            isExperimental: false,
+            fallbackPriority: 3,
+            estimatedSizeBytes: 1_800_000_000,
+            contextWindowTokens: 4096,
+            promptFormat: .qwen,
+            notes: "4-bit quantized CoreML conversion by finnvoorhees. Stable alternative."
+        ),
+        ModelSource(
+            id: "llama-3.2-1b",
+            displayName: "Llama 3.2 1B Instruct",
+            repoID: "yacht/Llama-3.2-1B-Instruct-CoreML",
+            role: .chat,
+            downloadStrategy: .archive(filename: "model.mlmodelc.zip"),
+            tokenizerFiles: ["tokenizer.json", "tokenizer_config.json"],
+            tokenizerRepoID: "meta-llama/Llama-3.2-1B-Instruct",
+            requiresAuth: false,
+            isRecommended: false,
+            isExperimental: false,
+            fallbackPriority: 1,
+            estimatedSizeBytes: 1_300_000_000,
+            contextWindowTokens: 2048,
+            promptFormat: .llama3,
+            notes: "Lightweight fallback. Broader device compatibility."
+        ),
     ]
 
-    static func entry(for variant: ModelVariant) -> ModelManifestEntry? {
-        entries[variant]
+    static let embeddingSources: [ModelSource] = [
+        ModelSource(
+            id: "qwen3-embed-0.6b",
+            displayName: "Qwen3 Embedding 0.6B",
+            repoID: "NeoRoth/qwen3-embedding-0.6b-coreml",
+            role: .embedding,
+            downloadStrategy: .repoDirectory(modelPath: "encoder.mlmodelc"),
+            tokenizerFiles: ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"],
+            tokenizerRepoID: nil,
+            requiresAuth: false,
+            isRecommended: true,
+            isExperimental: false,
+            fallbackPriority: 1,
+            estimatedSizeBytes: 1_200_000_000,
+            contextWindowTokens: 512,
+            promptFormat: .qwen,
+            notes: "Primary CoreML embedding model for semantic memory"
+        ),
+        ModelSource(
+            id: "qwen3-embed-0.6b-alt",
+            displayName: "Qwen3 Embedding 0.6B (Alt)",
+            repoID: "tooktang/Qwen3-Embedding-0.6B-CoreML",
+            role: .embedding,
+            downloadStrategy: .unsupported(reason: "Non-standard repository structure. Use the primary NeoRoth source."),
+            tokenizerFiles: ["tokenizer.json", "tokenizer_config.json"],
+            tokenizerRepoID: "Qwen/Qwen3-Embedding-0.6B",
+            requiresAuth: false,
+            isRecommended: false,
+            isExperimental: true,
+            fallbackPriority: 2,
+            estimatedSizeBytes: 1_200_000_000,
+            contextWindowTokens: 512,
+            promptFormat: .qwen,
+            notes: "Fallback embedding source. Non-standard repo layout."
+        ),
+    ]
+
+    static let allSources: [ModelSource] = chatSources + embeddingSources
+
+    static func source(for id: ModelSourceID) -> ModelSource? {
+        allSources.first { $0.id == id }
     }
 
-    static func archiveURL(for variant: ModelVariant) -> URL? {
-        guard let entry = entries[variant], !entry.archiveURL.isEmpty else { return nil }
-        return URL(string: entry.archiveURL)
+    static func chatSource(for id: ModelSourceID) -> ModelSource? {
+        chatSources.first { $0.id == id }
     }
 
-    static func tokenizerFileURL(for variant: ModelVariant, fileName: String) -> URL? {
-        guard let entry = entries[variant] else { return nil }
-        return URL(string: "\(entry.tokenizerBaseURL)/\(fileName)")
+    static func embeddingSource(for id: ModelSourceID) -> ModelSource? {
+        embeddingSources.first { $0.id == id }
     }
 
-    static func isAvailableForDownload(_ variant: ModelVariant) -> Bool {
-        guard let entry = entries[variant] else { return false }
-        return !entry.archiveURL.isEmpty
+    static var downloadableChatSources: [ModelSource] {
+        chatSources.filter(\.isAvailableForDownload)
+    }
+
+    static var downloadableEmbeddingSources: [ModelSource] {
+        embeddingSources.filter(\.isAvailableForDownload)
+    }
+
+    static var defaultChatSourceID: ModelSourceID { "llama-3.2-3b-4bit" }
+    static var defaultEmbeddingSourceID: ModelSourceID { "qwen3-embed-0.6b" }
+
+    static var fallbackChatSourceID: ModelSourceID { "llama-3.2-1b" }
+
+    static func migrateOldVariant(_ oldRawValue: String) -> ModelSourceID? {
+        switch oldRawValue {
+        case "llama-3.2-1b-instruct": return "llama-3.2-1b"
+        case "llama-3.2-3b-instruct": return "llama-3.2-3b-4bit"
+        case "granite-embedding-278m": return nil
+        default: return nil
+        }
     }
 }
 
@@ -165,7 +262,7 @@ nonisolated enum ModelDownloadState: Sendable, Equatable {
 }
 
 nonisolated struct ModelFileInfo: Sendable {
-    let variant: ModelVariant
+    let sourceID: ModelSourceID
     let localURL: URL
     let sizeOnDisk: Int64
 }
@@ -180,6 +277,8 @@ nonisolated enum ModelInstallError: Error, Sendable {
     case stagingCleanupFailed
     case notAvailableForDownload(String)
     case preflightFailed(String)
+    case hfTreeListFailed(String)
+    case fileDownloadFailed(String)
 }
 
 nonisolated enum DownloadDiagnosticError: Error, Sendable {
@@ -189,14 +288,14 @@ nonisolated enum DownloadDiagnosticError: Error, Sendable {
     case serverError(url: String, statusCode: Int)
     case unexpectedStatus(url: String, statusCode: Int, bodyPreview: String)
     case preflightUnreachable(url: String, underlyingError: String)
-    case noArchiveURL(variant: String)
+    case noDownloadURL(sourceID: String)
 
     var userMessage: String {
         switch self {
         case .accessDenied(let url, let code):
             "Access denied (HTTP \(code)). This model requires authentication on Hugging Face. URL: \(url)"
         case .notFound(let url):
-            "Model archive not found (HTTP 404). The file may have been moved or removed. URL: \(url)"
+            "Model artifact not found (HTTP 404). The file may have been moved or removed. URL: \(url)"
         case .rateLimited(let url):
             "Rate limited (HTTP 429). Please wait a few minutes and try again. URL: \(url)"
         case .serverError(let url, let code):
@@ -205,8 +304,33 @@ nonisolated enum DownloadDiagnosticError: Error, Sendable {
             "Unexpected response (HTTP \(code)) from \(url). Response: \(body)"
         case .preflightUnreachable(let url, let error):
             "Could not reach model host. URL: \(url). Error: \(error)"
-        case .noArchiveURL(let variant):
-            "No download URL configured for \(variant). This model may require manual conversion."
+        case .noDownloadURL(let sourceID):
+            "No download URL configured for \(sourceID)."
         }
     }
+}
+
+nonisolated enum InstallPhase: String, Sendable {
+    case preflight
+    case downloading
+    case extracting
+    case validating
+    case installingTokenizer
+    case complete
+}
+
+nonisolated enum OverallInstallPhase: String, Sendable {
+    case llmDownload
+    case llmInstall
+    case embeddingDownload
+    case embeddingInstall
+    case tokenizerInstall
+    case validation
+    case complete
+}
+
+nonisolated struct HFFileEntry: Sendable {
+    let path: String
+    let size: Int64
+    let type: String
 }

@@ -63,7 +63,7 @@ nonisolated struct GenerationResult: Sendable {
     let generationTimeSeconds: Double
     let tokensPerSecond: Double
     let finishReason: FinishReason
-    let variant: ModelVariant
+    let sourceID: ModelSourceID
 
     nonisolated enum FinishReason: String, Sendable {
         case endOfSequence
@@ -87,7 +87,7 @@ nonisolated struct InferenceSnapshot: Sendable {
     let elapsedSeconds: Double
     let peakMemoryBytes: UInt64
     let thermalState: ProcessInfo.ThermalState
-    let variant: ModelVariant
+    let sourceID: ModelSourceID
 
     var tokensPerSecond: Double {
         elapsedSeconds > 0 ? Double(tokensGenerated) / elapsedSeconds : 0

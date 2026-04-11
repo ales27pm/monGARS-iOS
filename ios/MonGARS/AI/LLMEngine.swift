@@ -23,7 +23,8 @@ actor LLMEngine {
     private var model: MLModel?
     private var state: MLState?
     private var tokenizer: TokenizerService?
-    private var currentVariant: ModelVariant?
+    private var currentSourceID: ModelSourceID?
+    private var currentContextWindow: Int = 2048
     private var engineState: LLMEngineState = .unloaded
     private var isStateful: Bool = false
 
@@ -33,9 +34,9 @@ actor LLMEngine {
 
     var currentState: LLMEngineState { engineState }
     var isReady: Bool { engineState == .ready }
-    var loadedVariant: ModelVariant? { currentVariant }
+    var loadedSourceID: ModelSourceID? { currentSourceID }
 
-    func loadModel(variant: ModelVariant, modelURL: URL, tokenizerDirectory: URL) async throws {
+    func loadModel(sourceID: ModelSourceID, modelURL: URL, tokenizerDirectory: URL, contextWindow: Int) async throws {
         guard engineState != .loading else { return }
         engineState = .loading
 
@@ -46,7 +47,7 @@ actor LLMEngine {
             try await tokService.load(from: tokenizerDirectory)
         } catch {
             engineState = .error("Tokenizer loading failed: \(error.localizedDescription)")
-            await diagnostics.recordError("Tokenizer load failed: \(error)", variant: variant)
+            await diagnostics.recordError("Tokenizer load failed: \(error)", sourceID: sourceID)
             throw error
         }
 
@@ -66,20 +67,21 @@ actor LLMEngine {
             isStateful = hasStatefulKVCache(loadedModel)
             if isStateful {
                 state = loadedModel.makeState()
-                logger.info("Stateful KV-cache detected and initialized for \(variant.rawValue)")
+                logger.info("Stateful KV-cache detected and initialized for \(sourceID)")
             }
 
             self.model = loadedModel
             self.tokenizer = tokService
-            self.currentVariant = variant
+            self.currentSourceID = sourceID
+            self.currentContextWindow = contextWindow
             self.engineState = .ready
 
             let loadDuration = CFAbsoluteTimeGetCurrent() - loadStart
-            await diagnostics.recordModelLoad(variant: variant, durationSeconds: loadDuration, success: true)
+            await diagnostics.recordModelLoad(sourceID: sourceID, durationSeconds: loadDuration, success: true)
         } catch {
             let loadDuration = CFAbsoluteTimeGetCurrent() - loadStart
             engineState = .error("Model loading failed: \(error.localizedDescription)")
-            await diagnostics.recordModelLoad(variant: variant, durationSeconds: loadDuration, success: false)
+            await diagnostics.recordModelLoad(sourceID: sourceID, durationSeconds: loadDuration, success: false)
             throw error
         }
     }
@@ -101,8 +103,8 @@ actor LLMEngine {
 
         let warmDuration = CFAbsoluteTimeGetCurrent() - warmStart
         engineState = .ready
-        if let variant = currentVariant {
-            await diagnostics.recordWarmup(variant: variant, durationSeconds: warmDuration)
+        if let sourceID = currentSourceID {
+            await diagnostics.recordWarmup(sourceID: sourceID, durationSeconds: warmDuration)
         }
     }
 
@@ -130,7 +132,7 @@ actor LLMEngine {
         let inputTokens = await tokenizer.encode(prompt)
         var generatedTokens = inputTokens
         let eosToken = await tokenizer.eosTokenId
-        let contextWindow = currentVariant?.contextWindowTokens ?? 2048
+        let contextWindow = currentContextWindow
 
         var mergedStopTokens = config.stopTokenIds
         mergedStopTokens.insert(eosToken)
@@ -176,14 +178,14 @@ actor LLMEngine {
         let outputTokens = Array(generatedTokens.suffix(newTokenCount))
         let text = await tokenizer.decode(outputTokens)
 
-        let variant = currentVariant ?? .llama1B
+        let sourceID = currentSourceID ?? "unknown"
         let snapshot = InferenceSnapshot(
             timestamp: Date(),
             tokensGenerated: newTokenCount,
             elapsedSeconds: genDuration,
             peakMemoryBytes: currentMemoryUsage(),
             thermalState: ProcessInfo.processInfo.thermalState,
-            variant: variant
+            sourceID: sourceID
         )
         await diagnostics.recordSnapshot(snapshot)
 
@@ -194,7 +196,7 @@ actor LLMEngine {
             generationTimeSeconds: genDuration,
             tokensPerSecond: genDuration > 0 ? Double(newTokenCount) / genDuration : 0,
             finishReason: finishReason,
-            variant: variant
+            sourceID: sourceID
         )
     }
 
@@ -202,7 +204,8 @@ actor LLMEngine {
         model = nil
         state = nil
         tokenizer = nil
-        currentVariant = nil
+        currentSourceID = nil
+        currentContextWindow = 2048
         isStateful = false
         engineState = .unloaded
         logger.info("LLM engine unloaded")
@@ -243,7 +246,7 @@ actor LLMEngine {
         let inputTokens = await tokenizer.encode(prompt)
         var generatedTokens = inputTokens
         let eosToken = await tokenizer.eosTokenId
-        let contextWindow = currentVariant?.contextWindowTokens ?? 2048
+        let contextWindow = currentContextWindow
 
         var mergedStopTokens = config.stopTokenIds
         mergedStopTokens.insert(eosToken)
@@ -294,20 +297,20 @@ actor LLMEngine {
             continuation.finish()
         } catch {
             continuation.finish(throwing: error)
-            if let variant = currentVariant {
-                await diagnostics.recordError("Generation error: \(error)", variant: variant)
+            if let sourceID = currentSourceID {
+                await diagnostics.recordError("Generation error: \(error)", sourceID: sourceID)
             }
         }
 
         let genDuration = CFAbsoluteTimeGetCurrent() - genStart
-        let variant = currentVariant ?? .llama1B
+        let sourceID = currentSourceID ?? "unknown"
         let snapshot = InferenceSnapshot(
             timestamp: Date(),
             tokensGenerated: newTokenCount,
             elapsedSeconds: genDuration,
             peakMemoryBytes: currentMemoryUsage(),
             thermalState: ProcessInfo.processInfo.thermalState,
-            variant: variant
+            sourceID: sourceID
         )
         await diagnostics.recordSnapshot(snapshot)
 
@@ -317,7 +320,7 @@ actor LLMEngine {
     private func predictNextTokenLogits(tokens: [Int]) async throws -> [Float] {
         guard let model else { throw LLMError.modelNotLoaded }
 
-        let maxLength = currentVariant?.contextWindowTokens ?? 2048
+        let maxLength = currentContextWindow
         let inputLength = min(tokens.count, maxLength)
         let truncatedTokens = Array(tokens.suffix(inputLength))
 

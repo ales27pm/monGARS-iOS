@@ -6,7 +6,7 @@ struct SettingsView: View {
     var body: some View {
         Form {
             languageSection
-            modelSection
+            chatModelSection
             embeddingSection
             networkSection
             voiceSection
@@ -16,6 +16,8 @@ struct SettingsView: View {
         .navigationTitle(viewModel.localeManager.localizedString("Settings", "R\u{00E9}glages"))
     }
 
+    // MARK: - Language
+
     private var languageSection: some View {
         Section {
             ForEach(AppLanguage.allCases) { language in
@@ -23,11 +25,9 @@ struct SettingsView: View {
                     viewModel.selectedLanguage = language
                 } label: {
                     HStack {
-                        VStack(alignment: .leading) {
-                            Text(language.displayName)
-                                .font(.body)
-                                .foregroundStyle(.primary)
-                        }
+                        Text(language.displayName)
+                            .font(.body)
+                            .foregroundStyle(.primary)
                         Spacer()
                         if viewModel.selectedLanguage == language {
                             Image(systemName: "checkmark")
@@ -41,18 +41,47 @@ struct SettingsView: View {
         }
     }
 
-    private var modelSection: some View {
+    // MARK: - Chat Model Picker
+
+    private var chatModelSection: some View {
         Section {
-            HStack {
-                VStack(alignment: .leading) {
-                    Text(viewModel.modelDownloadManager.selectedLLMVariant.displayName)
-                        .font(.body)
-                    Text(viewModel.localeManager.localizedString("Language Model — Conversation", "Mod\u{00E8}le de langue — Conversation"))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            ForEach(ModelSourceCatalog.chatSources) { source in
+                Button {
+                    viewModel.selectedChatSourceID = source.id
+                } label: {
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 6) {
+                                Text(source.displayName)
+                                    .font(.body)
+                                    .foregroundStyle(.primary)
+                                if let badge = source.badgeLabel {
+                                    Text(badge)
+                                        .font(.caption2.bold())
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 1)
+                                        .background(source.isExperimental ? Color.orange : Color.blue, in: Capsule())
+                                }
+                            }
+                            HStack(spacing: 8) {
+                                Text(source.estimatedSizeDescription)
+                                Text("•")
+                                Text(source.promptFormat == .llama3 ? "Llama" : "Qwen")
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        VStack(alignment: .trailing, spacing: 4) {
+                            if viewModel.selectedChatSourceID == source.id {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(.tint)
+                            }
+                            chatModelStatus(for: source)
+                        }
+                    }
                 }
-                Spacer()
-                modelStatusBadge(viewModel.modelDownloadManager.llmState)
             }
 
             if viewModel.modelDownloadManager.isLLMReady {
@@ -62,10 +91,12 @@ struct SettingsView: View {
                     Text(viewModel.modelDownloadManager.llmStorageUsed)
                         .foregroundStyle(.secondary)
                 }
+            }
 
+            if viewModel.modelDownloadManager.isLLMReady {
                 Button(role: .destructive) {
                     viewModel.showDeleteConfirmation = true
-                    viewModel.modelToDelete = viewModel.modelDownloadManager.selectedLLMVariant
+                    viewModel.deleteTargetSourceID = viewModel.selectedChatSourceID
                 } label: {
                     Label(
                         viewModel.localeManager.localizedString("Delete Model", "Supprimer le mod\u{00E8}le"),
@@ -73,17 +104,25 @@ struct SettingsView: View {
                     )
                 }
             } else if !viewModel.modelDownloadManager.llmState.isDownloading && !viewModel.modelDownloadManager.llmState.isInstalling {
-                Button {
-                    viewModel.downloadModel(viewModel.modelDownloadManager.selectedLLMVariant)
-                } label: {
-                    Label(
-                        viewModel.localeManager.localizedString("Download Model", "T\u{00E9}l\u{00E9}charger le mod\u{00E8}le"),
-                        systemImage: "arrow.down.circle"
-                    )
+                let source = viewModel.modelDownloadManager.selectedChatSource
+                if source?.isAvailableForDownload == true {
+                    Button {
+                        viewModel.downloadModel(viewModel.selectedChatSourceID)
+                    } label: {
+                        Label(
+                            viewModel.localeManager.localizedString("Download Model", "T\u{00E9}l\u{00E9}charger le mod\u{00E8}le"),
+                            systemImage: "arrow.down.circle"
+                        )
+                    }
                 }
             }
         } header: {
-            Text(viewModel.localeManager.localizedString("AI Model", "Mod\u{00E8}le IA"))
+            Text(viewModel.localeManager.localizedString("Chat Model", "Mod\u{00E8}le de conversation"))
+        } footer: {
+            Text(viewModel.localeManager.localizedString(
+                "Select the model used for conversation. Larger models are slower but more capable.",
+                "S\u{00E9}lectionne le mod\u{00E8}le utilis\u{00E9} pour la conversation. Les mod\u{00E8}les plus gros sont plus lents mais plus capables."
+            ))
         }
         .confirmationDialog(
             viewModel.localeManager.localizedString("Delete Model?", "Supprimer le mod\u{00E8}le?"),
@@ -91,8 +130,8 @@ struct SettingsView: View {
             titleVisibility: .visible
         ) {
             Button(viewModel.localeManager.localizedString("Delete", "Supprimer"), role: .destructive) {
-                if let variant = viewModel.modelToDelete {
-                    viewModel.deleteModel(variant)
+                if let sourceID = viewModel.deleteTargetSourceID {
+                    viewModel.deleteModel(sourceID)
                 }
             }
             Button(viewModel.localeManager.localizedString("Cancel", "Annuler"), role: .cancel) {}
@@ -104,11 +143,41 @@ struct SettingsView: View {
         }
     }
 
+    @ViewBuilder
+    private func chatModelStatus(for source: ModelSource) -> some View {
+        let state = viewModel.modelDownloadManager.stateForSource(source.id)
+        switch state {
+        case .installed:
+            Text(viewModel.localeManager.localizedString("Ready", "Pr\u{00EA}t"))
+                .font(.caption2)
+                .foregroundStyle(.green)
+        case .downloading(let p):
+            Text("\(Int(p * 100))%")
+                .font(.caption2)
+                .foregroundStyle(.tint)
+        case .installing:
+            ProgressView()
+                .controlSize(.mini)
+        case .unavailable:
+            Text(viewModel.localeManager.localizedString("Unavailable", "Indisponible"))
+                .font(.caption2)
+                .foregroundStyle(.orange)
+        case .error:
+            Image(systemName: "exclamationmark.triangle")
+                .font(.caption2)
+                .foregroundStyle(.red)
+        case .notDownloaded:
+            EmptyView()
+        }
+    }
+
+    // MARK: - Embedding
+
     private var embeddingSection: some View {
         Section {
             HStack {
                 VStack(alignment: .leading) {
-                    Text(ModelVariant.graniteEmbedding.displayName)
+                    Text(viewModel.modelDownloadManager.selectedEmbeddingSource?.displayName ?? "Embedding Model")
                         .font(.body)
                     Text(viewModel.localeManager.localizedString("Semantic Memory / Recall", "M\u{00E9}moire s\u{00E9}mantique / Rappel"))
                         .font(.caption)
@@ -127,7 +196,7 @@ struct SettingsView: View {
                 }
 
                 Button(role: .destructive) {
-                    viewModel.modelDownloadManager.deleteModel(variant: .graniteEmbedding)
+                    viewModel.deleteModel(viewModel.selectedEmbeddingSourceID)
                 } label: {
                     Label(
                         viewModel.localeManager.localizedString("Delete Embedding Model", "Supprimer le mod\u{00E8}le d'embeddings"),
@@ -139,11 +208,23 @@ struct SettingsView: View {
                     Image(systemName: "info.circle")
                         .foregroundStyle(.secondary)
                     Text(viewModel.localeManager.localizedString(
-                        "Requires a CoreML-converted embedding model. Chat works without it.",
-                        "N\u{00E9}cessite un mod\u{00E8}le d'embeddings converti en CoreML. Le clavardage fonctionne sans."
+                        "Embedding model is optional. Chat works without semantic memory.",
+                        "Le mod\u{00E8}le d'embeddings est optionnel. Le clavardage fonctionne sans m\u{00E9}moire s\u{00E9}mantique."
                     ))
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                }
+            } else if !viewModel.modelDownloadManager.embeddingState.isDownloading && !viewModel.modelDownloadManager.embeddingState.isInstalling {
+                let source = viewModel.modelDownloadManager.selectedEmbeddingSource
+                if source?.isAvailableForDownload == true {
+                    Button {
+                        viewModel.downloadModel(viewModel.selectedEmbeddingSourceID)
+                    } label: {
+                        Label(
+                            viewModel.localeManager.localizedString("Download Embedding Model", "T\u{00E9}l\u{00E9}charger le mod\u{00E8}le d'embeddings"),
+                            systemImage: "arrow.down.circle"
+                        )
+                    }
                 }
             }
         } header: {
@@ -151,40 +232,7 @@ struct SettingsView: View {
         }
     }
 
-    private var voiceSection: some View {
-        Section {
-            HStack {
-                Text(viewModel.localeManager.localizedString("Microphone", "Microphone"))
-                Spacer()
-                Text(viewModel.permissionsManager.microphoneGranted
-                     ? viewModel.localeManager.localizedString("Granted", "Accord\u{00E9}")
-                     : viewModel.localeManager.localizedString("Not Granted", "Non accord\u{00E9}"))
-                    .foregroundStyle(viewModel.permissionsManager.microphoneGranted ? .green : .secondary)
-            }
-
-            HStack {
-                Text(viewModel.localeManager.localizedString("Speech Recognition", "Reconnaissance vocale"))
-                Spacer()
-                Text(viewModel.permissionsManager.speechRecognitionGranted
-                     ? viewModel.localeManager.localizedString("Granted", "Accord\u{00E9}")
-                     : viewModel.localeManager.localizedString("Not Granted", "Non accord\u{00E9}"))
-                    .foregroundStyle(viewModel.permissionsManager.speechRecognitionGranted ? .green : .secondary)
-            }
-
-            if !viewModel.permissionsManager.canUseVoice {
-                Button {
-                    Task { await viewModel.requestVoicePermissions() }
-                } label: {
-                    Label(
-                        viewModel.localeManager.localizedString("Grant Voice Permissions", "Accorder les permissions vocales"),
-                        systemImage: "mic.badge.plus"
-                    )
-                }
-            }
-        } header: {
-            Text(viewModel.localeManager.localizedString("Voice", "Voix"))
-        }
-    }
+    // MARK: - Network
 
     private var networkSection: some View {
         Section {
@@ -226,6 +274,45 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Voice
+
+    private var voiceSection: some View {
+        Section {
+            HStack {
+                Text(viewModel.localeManager.localizedString("Microphone", "Microphone"))
+                Spacer()
+                Text(viewModel.permissionsManager.microphoneGranted
+                     ? viewModel.localeManager.localizedString("Granted", "Accord\u{00E9}")
+                     : viewModel.localeManager.localizedString("Not Granted", "Non accord\u{00E9}"))
+                    .foregroundStyle(viewModel.permissionsManager.microphoneGranted ? .green : .secondary)
+            }
+
+            HStack {
+                Text(viewModel.localeManager.localizedString("Speech Recognition", "Reconnaissance vocale"))
+                Spacer()
+                Text(viewModel.permissionsManager.speechRecognitionGranted
+                     ? viewModel.localeManager.localizedString("Granted", "Accord\u{00E9}")
+                     : viewModel.localeManager.localizedString("Not Granted", "Non accord\u{00E9}"))
+                    .foregroundStyle(viewModel.permissionsManager.speechRecognitionGranted ? .green : .secondary)
+            }
+
+            if !viewModel.permissionsManager.canUseVoice {
+                Button {
+                    Task { await viewModel.requestVoicePermissions() }
+                } label: {
+                    Label(
+                        viewModel.localeManager.localizedString("Grant Voice Permissions", "Accorder les permissions vocales"),
+                        systemImage: "mic.badge.plus"
+                    )
+                }
+            }
+        } header: {
+            Text(viewModel.localeManager.localizedString("Voice", "Voix"))
+        }
+    }
+
+    // MARK: - Privacy
+
     private var privacySection: some View {
         Section {
             Label {
@@ -264,6 +351,8 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - About
+
     private var aboutSection: some View {
         Section {
             HStack {
@@ -276,6 +365,8 @@ struct SettingsView: View {
             Text(viewModel.localeManager.localizedString("About", "\u{00C0} propos"))
         }
     }
+
+    // MARK: - Helpers
 
     @ViewBuilder
     private func modelStatusBadge(_ state: ModelDownloadState) -> some View {

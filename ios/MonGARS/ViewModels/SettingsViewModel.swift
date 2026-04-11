@@ -9,7 +9,7 @@ final class SettingsViewModel {
     let networkPolicy: NetworkPolicyService
 
     var showDeleteConfirmation: Bool = false
-    var modelToDelete: ModelVariant?
+    var deleteTargetSourceID: ModelSourceID?
 
     init(
         localeManager: LocaleManager,
@@ -22,9 +22,19 @@ final class SettingsViewModel {
         self.permissionsManager = permissionsManager
         self.networkPolicy = networkPolicy
 
-        if let storedVariant = SecureStoreService.syncLoad(key: .selectedModelVariant),
-           let variant = ModelVariant(rawValue: storedVariant) {
-            modelDownloadManager.selectedLLMVariant = variant
+        if let storedID = SecureStoreService.syncLoad(key: .selectedModelVariant) {
+            if ModelSourceCatalog.chatSource(for: storedID) != nil {
+                modelDownloadManager.selectedChatSourceID = storedID
+            } else if let migrated = ModelSourceCatalog.migrateOldVariant(storedID),
+                      ModelSourceCatalog.chatSource(for: migrated) != nil {
+                modelDownloadManager.selectedChatSourceID = migrated
+            }
+        }
+
+        if let storedEmbedID = SecureStoreService.syncLoad(key: .selectedEmbeddingSource) {
+            if ModelSourceCatalog.embeddingSource(for: storedEmbedID) != nil {
+                modelDownloadManager.selectedEmbeddingSourceID = storedEmbedID
+            }
         }
     }
 
@@ -33,22 +43,32 @@ final class SettingsViewModel {
         set { localeManager.currentLanguage = newValue }
     }
 
-    var selectedModelVariant: ModelVariant {
-        get { modelDownloadManager.selectedLLMVariant }
+    var selectedChatSourceID: ModelSourceID {
+        get { modelDownloadManager.selectedChatSourceID }
         set {
-            modelDownloadManager.selectedLLMVariant = newValue
+            modelDownloadManager.selectedChatSourceID = newValue
             Task {
-                try? await SecureStoreService.shared.save(key: .selectedModelVariant, value: newValue.rawValue)
+                try? await SecureStoreService.shared.save(key: .selectedModelVariant, value: newValue)
             }
         }
     }
 
-    func deleteModel(_ variant: ModelVariant) {
-        modelDownloadManager.deleteModel(variant: variant)
+    var selectedEmbeddingSourceID: ModelSourceID {
+        get { modelDownloadManager.selectedEmbeddingSourceID }
+        set {
+            modelDownloadManager.selectedEmbeddingSourceID = newValue
+            Task {
+                try? await SecureStoreService.shared.save(key: .selectedEmbeddingSource, value: newValue)
+            }
+        }
     }
 
-    func downloadModel(_ variant: ModelVariant) {
-        modelDownloadManager.startDownload(variant: variant)
+    func deleteModel(_ sourceID: ModelSourceID) {
+        modelDownloadManager.deleteModel(sourceID: sourceID)
+    }
+
+    func downloadModel(_ sourceID: ModelSourceID) {
+        modelDownloadManager.startDownload(sourceID: sourceID)
     }
 
     func requestVoicePermissions() async {

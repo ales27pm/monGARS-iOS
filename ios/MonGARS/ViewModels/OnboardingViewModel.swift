@@ -75,6 +75,14 @@ final class OnboardingViewModel {
         modelDownloadManager.embeddingState.errorMessage
     }
 
+    var selectedChatSource: ModelSource? {
+        modelDownloadManager.selectedChatSource
+    }
+
+    var selectedEmbeddingSource: ModelSource? {
+        modelDownloadManager.selectedEmbeddingSource
+    }
+
     var installPhaseDescription: String? {
         guard let phase = modelDownloadManager.currentInstallPhase else { return nil }
         switch phase {
@@ -114,16 +122,16 @@ final class OnboardingViewModel {
     }
 
     func startDownload() {
-        modelDownloadManager.startDownload(variant: modelDownloadManager.selectedLLMVariant)
+        modelDownloadManager.startDownload(sourceID: modelDownloadManager.selectedChatSourceID)
     }
 
     func startEmbeddingDownload() {
-        modelDownloadManager.startDownload(variant: .graniteEmbedding)
+        modelDownloadManager.startDownload(sourceID: modelDownloadManager.selectedEmbeddingSourceID)
     }
 
     func cancelDownload() {
-        modelDownloadManager.cancelDownload(variant: modelDownloadManager.selectedLLMVariant)
-        modelDownloadManager.cancelDownload(variant: .graniteEmbedding)
+        modelDownloadManager.cancelDownload(sourceID: modelDownloadManager.selectedChatSourceID)
+        modelDownloadManager.cancelDownload(sourceID: modelDownloadManager.selectedEmbeddingSourceID)
     }
 
     func advanceStep() {
