@@ -56,7 +56,12 @@ final class ModelRuntimeCoordinator {
     }
 
     func loadLLMIfAvailable() async {
+        await loadLLMIfAvailable(expectedSourceID: nil)
+    }
+
+    private func loadLLMIfAvailable(expectedSourceID: ModelSourceID?) async {
         let sourceID = modelDownloadManager.selectedChatSourceID
+        if let expectedSourceID, expectedSourceID != sourceID { return }
         let llmState = modelDownloadManager.llmState
         guard llmState.isDownloaded || llmState.isInstalledPartially else {
             runtimeState = .degraded("LLM model not downloaded")
@@ -90,11 +95,25 @@ final class ModelRuntimeCoordinator {
 
         do {
             try await llmEngine.loadModel(sourceID: sourceID, modelURL: modelURL, tokenizerDirectory: tokenizerDir, contextWindow: contextWindow)
+            if let expectedSourceID, modelDownloadManager.selectedChatSourceID != expectedSourceID {
+                await llmEngine.unloadModel()
+                return
+            }
             await llmEngine.warmup()
+            if let expectedSourceID, modelDownloadManager.selectedChatSourceID != expectedSourceID {
+                await llmEngine.unloadModel()
+                return
+            }
             llmReady = await llmEngine.isReady
+            if let expectedSourceID, modelDownloadManager.selectedChatSourceID != expectedSourceID {
+                llmReady = false
+                await llmEngine.unloadModel()
+                return
+            }
             updateRuntimeState()
         } catch {
             logger.error("LLM load failed: \(error.localizedDescription)")
+            if let expectedSourceID, modelDownloadManager.selectedChatSourceID != expectedSourceID { return }
             runtimeState = .error("Failed to load language model: \(error.localizedDescription)")
             llmReady = false
             lastLLMLoadError = error.localizedDescription
@@ -103,7 +122,12 @@ final class ModelRuntimeCoordinator {
     }
 
     func loadEmbeddingIfAvailable() async {
+        await loadEmbeddingIfAvailable(expectedSourceID: nil)
+    }
+
+    private func loadEmbeddingIfAvailable(expectedSourceID: ModelSourceID?) async {
         let sourceID = modelDownloadManager.selectedEmbeddingSourceID
+        if let expectedSourceID, expectedSourceID != sourceID { return }
         guard modelDownloadManager.embeddingState.isDownloaded else { return }
 
         runtimeState = .loadingEmbedding
@@ -120,10 +144,20 @@ final class ModelRuntimeCoordinator {
 
         do {
             try await embeddingEngine.loadModel(sourceID: sourceID, modelURL: modelURL, tokenizerDirectory: tokenizerDir, contextWindow: contextWindow)
+            if let expectedSourceID, modelDownloadManager.selectedEmbeddingSourceID != expectedSourceID {
+                await embeddingEngine.unloadModel()
+                return
+            }
             embeddingReady = await embeddingEngine.isReady
+            if let expectedSourceID, modelDownloadManager.selectedEmbeddingSourceID != expectedSourceID {
+                embeddingReady = false
+                await embeddingEngine.unloadModel()
+                return
+            }
             updateRuntimeState()
         } catch {
             logger.error("Embedding load failed: \(error.localizedDescription)")
+            if let expectedSourceID, modelDownloadManager.selectedEmbeddingSourceID != expectedSourceID { return }
             embeddingReady = false
             updateRuntimeState()
         }
@@ -135,7 +169,9 @@ final class ModelRuntimeCoordinator {
     }
 
     func reloadSelectedChatModelRuntime() async {
+        let startID = modelDownloadManager.selectedChatSourceID
         await llmEngine.unloadModel()
+        guard modelDownloadManager.selectedChatSourceID == startID else { return }
         llmReady = false
         clearLLMFailureState()
 
@@ -145,11 +181,13 @@ final class ModelRuntimeCoordinator {
             return
         }
 
-        await loadLLMIfAvailable()
+        await loadLLMIfAvailable(expectedSourceID: startID)
     }
 
     func reloadSelectedEmbeddingModelRuntime() async {
+        let startID = modelDownloadManager.selectedEmbeddingSourceID
         await embeddingEngine.unloadModel()
+        guard modelDownloadManager.selectedEmbeddingSourceID == startID else { return }
         embeddingReady = false
 
         guard modelDownloadManager.embeddingState.isInstalled else {
@@ -157,7 +195,7 @@ final class ModelRuntimeCoordinator {
             return
         }
 
-        await loadEmbeddingIfAvailable()
+        await loadEmbeddingIfAvailable(expectedSourceID: startID)
     }
 
     func unloadAll() async {
@@ -221,7 +259,17 @@ final class ModelRuntimeCoordinator {
         if !modelDownloadManager.hasTokenizer(for: sourceID) {
             return .tokenizerMissing
         }
-        if !llmReady {
+        guard !llmReady else { return nil }
+        if case .loadingLLM = runtimeState {
+            return nil
+        }
+        if case .idle = runtimeState {
+            return nil
+        }
+        if case .error = runtimeState {
+            return .runtimeLoadFailed(lastLLMLoadFailureCategory ?? .initializationFailed)
+        }
+        if lastLLMLoadFailureCategory != nil {
             return .runtimeLoadFailed(lastLLMLoadFailureCategory ?? .initializationFailed)
         }
         return nil
