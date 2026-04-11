@@ -72,15 +72,11 @@ struct ContentView: View {
                 }
                 .onChange(of: modelDownloadManager.selectedChatSourceID) { _, _ in
                     guard let coordinator = runtimeCoordinator else { return }
-                    Task {
-                        await coordinator.reloadSelectedChatModelRuntime()
-                    }
+                    coordinator.requestChatReloadForSelectionChange()
                 }
                 .onChange(of: modelDownloadManager.selectedEmbeddingSourceID) { _, _ in
                     guard let coordinator = runtimeCoordinator else { return }
-                    Task {
-                        await coordinator.reloadSelectedEmbeddingModelRuntime()
-                    }
+                    coordinator.requestEmbeddingReloadForSelectionChange()
                 }
         }
     }

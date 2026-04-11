@@ -40,6 +40,8 @@ final class ModelRuntimeCoordinator {
     private let logger = Logger(subsystem: "com.mongars.ai", category: "runtime")
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var thermalObserver: NSObjectProtocol?
+    private var chatReloadTask: Task<Void, Never>?
+    private var embeddingReloadTask: Task<Void, Never>?
 
     init(modelDownloadManager: ModelDownloadManager) {
         let diag = InferenceDiagnostics()
@@ -166,6 +168,22 @@ final class ModelRuntimeCoordinator {
     func loadAllAvailable() async {
         await loadLLMIfAvailable()
         await loadEmbeddingIfAvailable()
+    }
+
+    func requestChatReloadForSelectionChange() {
+        chatReloadTask?.cancel()
+        chatReloadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.reloadSelectedChatModelRuntime()
+        }
+    }
+
+    func requestEmbeddingReloadForSelectionChange() {
+        embeddingReloadTask?.cancel()
+        embeddingReloadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.reloadSelectedEmbeddingModelRuntime()
+        }
     }
 
     func reloadSelectedChatModelRuntime() async {
@@ -350,6 +368,8 @@ final class ModelRuntimeCoordinator {
     }
 
     func cleanup() {
+        chatReloadTask?.cancel()
+        embeddingReloadTask?.cancel()
         memoryPressureSource?.cancel()
         if let thermalObserver {
             NotificationCenter.default.removeObserver(thermalObserver)
