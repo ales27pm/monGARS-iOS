@@ -151,11 +151,29 @@ final class ChatViewModel {
                     "The selected AI model is installed, but tokenizer files are missing. Reinstall the model from Settings.",
                     "Le modèle IA sélectionné est installé, mais les fichiers tokenizer sont manquants. Réinstallez le modèle depuis les Réglages."
                 )
-            case .runtimeLoadFailed(let details):
-                unavailableMessage = localeManager.localizedString(
-                    "The selected AI model is installed, but failed to load at runtime. Please retry loading from Settings. Error: \(details)",
-                    "Le modèle IA sélectionné est installé, mais son chargement d'exécution a échoué. Veuillez réessayer depuis les Réglages. Erreur : \(details)"
-                )
+            case .runtimeLoadFailed(let category):
+                switch category {
+                case .modelFilesMissing:
+                    unavailableMessage = localeManager.localizedString(
+                        "The selected AI model is installed, but required model files are missing or invalid. Reinstall it from Settings.",
+                        "Le modèle IA sélectionné est installé, mais des fichiers requis sont manquants ou invalides. Réinstallez-le depuis les Réglages."
+                    )
+                case .tokenizerInvalid:
+                    unavailableMessage = localeManager.localizedString(
+                        "The selected AI model is installed, but tokenizer data is invalid. Reinstall the model from Settings.",
+                        "Le modèle IA sélectionné est installé, mais les données du tokenizer sont invalides. Réinstallez le modèle depuis les Réglages."
+                    )
+                case .outOfMemory:
+                    unavailableMessage = localeManager.localizedString(
+                        "The selected AI model could not be loaded due to memory pressure. Close other apps and try again.",
+                        "Le modèle IA sélectionné n'a pas pu être chargé à cause d'une pression mémoire. Fermez d'autres apps et réessayez."
+                    )
+                case .initializationFailed:
+                    unavailableMessage = localeManager.localizedString(
+                        "The selected AI model is installed, but runtime initialization failed. Please retry from Settings.",
+                        "Le modèle IA sélectionné est installé, mais l'initialisation du runtime a échoué. Veuillez réessayer depuis les Réglages."
+                    )
+                }
             case .none:
                 unavailableMessage = localeManager.localizedString(
                     "The AI model is currently unavailable. Please verify model settings.",

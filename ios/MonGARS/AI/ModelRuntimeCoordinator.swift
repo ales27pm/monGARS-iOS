@@ -13,10 +13,17 @@ nonisolated enum RuntimeState: Sendable, Equatable {
 @Observable
 @MainActor
 final class ModelRuntimeCoordinator {
+    nonisolated enum LLMRuntimeFailureCategory: Sendable, Equatable {
+        case modelFilesMissing
+        case tokenizerInvalid
+        case outOfMemory
+        case initializationFailed
+    }
+
     nonisolated enum LLMAvailabilityIssue: Sendable, Equatable {
         case notInstalled
         case tokenizerMissing
-        case runtimeLoadFailed(String)
+        case runtimeLoadFailed(LLMRuntimeFailureCategory)
     }
 
     let llmEngine: LLMEngine
@@ -28,6 +35,7 @@ final class ModelRuntimeCoordinator {
     private(set) var llmReady: Bool = false
     private(set) var embeddingReady: Bool = false
     private(set) var lastLLMLoadError: String?
+    private(set) var lastLLMLoadFailureCategory: LLMRuntimeFailureCategory?
 
     private let logger = Logger(subsystem: "com.mongars.ai", category: "runtime")
     private var memoryPressureSource: DispatchSourceMemoryPressure?
@@ -52,24 +60,25 @@ final class ModelRuntimeCoordinator {
         let llmState = modelDownloadManager.llmState
         guard llmState.isDownloaded || llmState.isInstalledPartially else {
             runtimeState = .degraded("LLM model not downloaded")
-            lastLLMLoadError = nil
+            clearLLMFailureState()
             return
         }
 
         guard modelDownloadManager.hasTokenizer(for: sourceID) else {
             runtimeState = .degraded("Tokenizer missing for \(sourceID). Chat model cannot load without tokenizer files.")
             llmReady = false
-            lastLLMLoadError = nil
+            clearLLMFailureState()
             return
         }
 
         runtimeState = .loadingLLM
-        lastLLMLoadError = nil
+        clearLLMFailureState()
 
         guard let modelURL = modelDownloadManager.modelFileURL(for: sourceID) else {
             runtimeState = .error("Model files not found on disk")
             llmReady = false
             lastLLMLoadError = "Model files not found on disk"
+            lastLLMLoadFailureCategory = .modelFilesMissing
             return
         }
 
@@ -89,6 +98,7 @@ final class ModelRuntimeCoordinator {
             runtimeState = .error("Failed to load language model: \(error.localizedDescription)")
             llmReady = false
             lastLLMLoadError = error.localizedDescription
+            lastLLMLoadFailureCategory = classifyLLMLoadFailure(error)
         }
     }
 
@@ -127,7 +137,7 @@ final class ModelRuntimeCoordinator {
     func reloadSelectedChatModelRuntime() async {
         await llmEngine.unloadModel()
         llmReady = false
-        lastLLMLoadError = nil
+        clearLLMFailureState()
 
         let llmState = modelDownloadManager.llmState
         guard llmState.isInstalled || llmState.isInstalledPartially else {
@@ -155,6 +165,7 @@ final class ModelRuntimeCoordinator {
         await embeddingEngine.unloadModel()
         llmReady = false
         embeddingReady = false
+        clearLLMFailureState()
         runtimeState = .idle
     }
 
@@ -176,6 +187,7 @@ final class ModelRuntimeCoordinator {
         }
 
         await llmEngine.unloadModel()
+        clearLLMFailureState()
 
         do {
             guard let modelURL = modelDownloadManager.modelFileURL(for: fallbackID) else {
@@ -192,6 +204,8 @@ final class ModelRuntimeCoordinator {
         } catch {
             runtimeState = .error("Fallback load failed: \(error.localizedDescription)")
             llmReady = false
+            lastLLMLoadError = error.localizedDescription
+            lastLLMLoadFailureCategory = classifyLLMLoadFailure(error)
         }
     }
 
@@ -208,7 +222,7 @@ final class ModelRuntimeCoordinator {
             return .tokenizerMissing
         }
         if !llmReady {
-            return .runtimeLoadFailed(lastLLMLoadError ?? "Unknown runtime loading error")
+            return .runtimeLoadFailed(lastLLMLoadFailureCategory ?? .initializationFailed)
         }
         return nil
     }
@@ -223,6 +237,25 @@ final class ModelRuntimeCoordinator {
         } else {
             runtimeState = .degraded("Some models not loaded")
         }
+    }
+
+    private func clearLLMFailureState() {
+        lastLLMLoadError = nil
+        lastLLMLoadFailureCategory = nil
+    }
+
+    private func classifyLLMLoadFailure(_ error: Error) -> LLMRuntimeFailureCategory {
+        let message = error.localizedDescription.lowercased()
+        if message.contains("tokenizer") {
+            return .tokenizerInvalid
+        }
+        if message.contains("memory") || message.contains("out of memory") {
+            return .outOfMemory
+        }
+        if message.contains("file") || message.contains("not found") || message.contains("missing") {
+            return .modelFilesMissing
+        }
+        return .initializationFailed
     }
 
     private func setupSystemMonitoring() {
@@ -255,6 +288,8 @@ final class ModelRuntimeCoordinator {
 
         if !llmReady {
             runtimeState = .degraded("Model unloaded due to memory pressure")
+            lastLLMLoadFailureCategory = .outOfMemory
+            lastLLMLoadError = "Model unloaded due to memory pressure"
         }
     }
 
