@@ -6,6 +6,7 @@ struct ContentView: View {
     @Environment(ModelDownloadManager.self) private var modelDownloadManager
     @Environment(PermissionsManager.self) private var permissionsManager
     @Environment(ToolRegistry.self) private var toolRegistry
+    @Environment(NetworkPolicyService.self) private var networkPolicy
 
     @State private var selectedTab: AppTab = .conversations
     @State private var selectedConversation: Conversation?
@@ -91,7 +92,8 @@ struct ContentView: View {
                         viewModel: SettingsViewModel(
                             localeManager: localeManager,
                             modelDownloadManager: modelDownloadManager,
-                            permissionsManager: permissionsManager
+                            permissionsManager: permissionsManager,
+                            networkPolicy: networkPolicy
                         )
                     )
                 }
@@ -106,6 +108,7 @@ struct ContentView: View {
                 llmEngine: coordinator.llmEngine,
                 toolRegistry: toolRegistry,
                 localeManager: localeManager,
+                networkPolicy: networkPolicy,
                 memoryService: memoryService
             )
 

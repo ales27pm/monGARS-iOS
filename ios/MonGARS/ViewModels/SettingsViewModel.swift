@@ -6,6 +6,7 @@ final class SettingsViewModel {
     let localeManager: LocaleManager
     let modelDownloadManager: ModelDownloadManager
     let permissionsManager: PermissionsManager
+    let networkPolicy: NetworkPolicyService
 
     var showDeleteConfirmation: Bool = false
     var modelToDelete: ModelVariant?
@@ -13,11 +14,13 @@ final class SettingsViewModel {
     init(
         localeManager: LocaleManager,
         modelDownloadManager: ModelDownloadManager,
-        permissionsManager: PermissionsManager
+        permissionsManager: PermissionsManager,
+        networkPolicy: NetworkPolicyService
     ) {
         self.localeManager = localeManager
         self.modelDownloadManager = modelDownloadManager
         self.permissionsManager = permissionsManager
+        self.networkPolicy = networkPolicy
 
         if let storedVariant = SecureStoreService.syncLoad(key: .selectedModelVariant),
            let variant = ModelVariant(rawValue: storedVariant) {

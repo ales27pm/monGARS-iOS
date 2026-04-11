@@ -8,6 +8,7 @@ struct MonGARSApp: App {
     @State private var permissionsManager = PermissionsManager()
     @State private var toolRegistry = ToolRegistry()
     @State private var locationService = LocationService()
+    @State private var networkPolicy = NetworkPolicyService()
     @State private var toolsRegistered = false
 
     init() {
@@ -27,6 +28,7 @@ struct MonGARSApp: App {
                 .environment(permissionsManager)
                 .environment(toolRegistry)
                 .environment(locationService)
+                .environment(networkPolicy)
                 .task {
                     if !toolsRegistered {
                         registerTools()
@@ -45,5 +47,6 @@ struct MonGARSApp: App {
         toolRegistry.register(OpenMapsTool())
         toolRegistry.register(SendNotificationTool())
         toolRegistry.register(GetWeatherTool(locationService: locationService))
+        toolRegistry.register(WebSearchTool())
     }
 }

@@ -7,14 +7,16 @@ final class AgentOrchestrator {
     let toolRegistry: ToolRegistry
     let localeManager: LocaleManager
     let memoryService: SemanticMemoryService?
+    let networkPolicy: NetworkPolicyService
 
     var pendingToolCall: ToolCallRequest?
     var isProcessing: Bool = false
 
-    init(llmEngine: LLMEngine, toolRegistry: ToolRegistry, localeManager: LocaleManager, memoryService: SemanticMemoryService? = nil) {
+    init(llmEngine: LLMEngine, toolRegistry: ToolRegistry, localeManager: LocaleManager, networkPolicy: NetworkPolicyService, memoryService: SemanticMemoryService? = nil) {
         self.llmEngine = llmEngine
         self.toolRegistry = toolRegistry
         self.localeManager = localeManager
+        self.networkPolicy = networkPolicy
         self.memoryService = memoryService
     }
 
@@ -110,6 +112,14 @@ final class AgentOrchestrator {
 
     func approveToolCall() async -> ToolCallResult {
         guard let call = pendingToolCall else { return .cancelled }
+
+        if toolRegistry.isNetworkRequired(toolName: call.toolName) {
+            guard networkPolicy.isToolAllowed(call.toolName) else {
+                pendingToolCall = nil
+                return .failure("Network tool '\(call.toolName)' is disabled. Enable it in Settings > Network Tools.")
+            }
+        }
+
         let result = await toolRegistry.execute(toolName: call.toolName, arguments: call.arguments)
         pendingToolCall = nil
         return result
@@ -120,22 +130,43 @@ final class AgentOrchestrator {
     }
 
     private func systemPrompt(for language: AppLanguage) -> String {
-        let toolDescriptions = toolRegistry.availableToolDescriptions(offlineOnly: false)
+        let toolDescriptions = toolRegistry.availableToolDescriptions(policy: networkPolicy)
+
+        let networkClause: String
+        if networkPolicy.isNetworkAllowed {
+            switch language {
+            case .englishCA:
+                networkClause = "Some tools may access the internet when enabled by the user."
+            case .frenchCA:
+                networkClause = "Certains outils peuvent acc\u{00E9}der \u{00E0} Internet lorsqu'ils sont activ\u{00E9}s par l'utilisateur."
+            }
+        } else {
+            switch language {
+            case .englishCA:
+                networkClause = "You are currently in offline mode. Only local tools are available."
+            case .frenchCA:
+                networkClause = "Tu es pr\u{00E9}sentement en mode hors ligne. Seuls les outils locaux sont disponibles."
+            }
+        }
 
         let base: String
         switch language {
         case .englishCA:
             base = """
-            You are monGARS, a helpful bilingual assistant running entirely on this device. \
-            You respect user privacy and operate locally. \
+            You are monGARS, a helpful bilingual assistant. \
+            Your core reasoning, memory, and voice capabilities run entirely on this device. \
+            You respect user privacy. \
             You speak English (Canadian) and French (Canadian). \
+            \(networkClause) \
             \(language.systemPromptLanguageInstruction)
             """
         case .frenchCA:
             base = """
-            Tu es monGARS, un assistant bilingue qui fonctionne enti\u{00E8}rement sur cet appareil. \
-            Tu respectes la vie priv\u{00E9}e de l'utilisateur et tu op\u{00E8}res localement. \
+            Tu es monGARS, un assistant bilingue. \
+            Ton raisonnement, ta m\u{00E9}moire et tes capacit\u{00E9}s vocales fonctionnent enti\u{00E8}rement sur cet appareil. \
+            Tu respectes la vie priv\u{00E9}e de l'utilisateur. \
             Tu parles anglais (canadien) et fran\u{00E7}ais (canadien). \
+            \(networkClause) \
             \(language.systemPromptLanguageInstruction)
             """
         }

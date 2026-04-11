@@ -24,9 +24,12 @@ final class ToolRegistry {
         tools[toolName]?.schema.requiresNetwork ?? false
     }
 
-    func availableToolDescriptions(offlineOnly: Bool = false) -> String {
+    func availableToolDescriptions(policy: NetworkPolicyService?) -> String {
         let filtered = tools.values.filter { tool in
-            if offlineOnly { return !tool.schema.requiresNetwork }
+            if tool.schema.requiresNetwork {
+                guard let policy else { return false }
+                return policy.isToolAllowed(tool.schema.name)
+            }
             return true
         }
 

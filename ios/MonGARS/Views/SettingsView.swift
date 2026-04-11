@@ -7,6 +7,7 @@ struct SettingsView: View {
         Form {
             languageSection
             modelSection
+            networkSection
             voiceSection
             privacySection
             aboutSection
@@ -137,6 +138,46 @@ struct SettingsView: View {
         }
     }
 
+    private var networkSection: some View {
+        Section {
+            Toggle(
+                viewModel.localeManager.localizedString("Offline Mode", "Mode hors ligne"),
+                isOn: Bindable(viewModel.networkPolicy).offlineMode
+            )
+
+            if !viewModel.networkPolicy.offlineMode {
+                Toggle(
+                    viewModel.localeManager.localizedString("Allow Network Tools", "Autoriser les outils r\u{00E9}seau"),
+                    isOn: Bindable(viewModel.networkPolicy).networkToolsEnabled
+                )
+
+                if viewModel.networkPolicy.networkToolsEnabled {
+                    Toggle(
+                        viewModel.localeManager.localizedString("Web Search", "Recherche Web"),
+                        isOn: Bindable(viewModel.networkPolicy).allowWebSearch
+                    )
+
+                    Toggle(
+                        viewModel.localeManager.localizedString("Weather", "M\u{00E9}t\u{00E9}o"),
+                        isOn: Bindable(viewModel.networkPolicy).allowWeather
+                    )
+
+                    Toggle(
+                        viewModel.localeManager.localizedString("Ask Before Network Use", "Demander avant d'utiliser le r\u{00E9}seau"),
+                        isOn: Bindable(viewModel.networkPolicy).askBeforeNetworkUse
+                    )
+                }
+            }
+        } header: {
+            Text(viewModel.localeManager.localizedString("Network Tools", "Outils r\u{00E9}seau"))
+        } footer: {
+            Text(viewModel.localeManager.localizedString(
+                "Core reasoning, memory, and voice always run on-device. Network tools are optional and require your permission.",
+                "Le raisonnement, la m\u{00E9}moire et la voix fonctionnent toujours sur l'appareil. Les outils r\u{00E9}seau sont optionnels et n\u{00E9}cessitent ta permission."
+            ))
+        }
+    }
+
     private var privacySection: some View {
         Section {
             Label {
@@ -144,8 +185,8 @@ struct SettingsView: View {
                     Text(viewModel.localeManager.localizedString("On-Device Processing", "Traitement sur l'appareil"))
                         .font(.body)
                     Text(viewModel.localeManager.localizedString(
-                        "All AI processing happens locally on your device",
-                        "Tout le traitement IA se fait localement sur ton appareil"
+                        "Core AI runs locally. Some optional tools may use the internet when enabled.",
+                        "L'IA de base fonctionne localement. Certains outils optionnels peuvent utiliser Internet lorsqu'activ\u{00E9}s."
                     ))
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -160,8 +201,8 @@ struct SettingsView: View {
                     Text(viewModel.localeManager.localizedString("No Data Collection", "Aucune collecte de donn\u{00E9}es"))
                         .font(.body)
                     Text(viewModel.localeManager.localizedString(
-                        "Your conversations are never sent anywhere",
-                        "Tes conversations ne sont jamais envoy\u{00E9}es nulle part"
+                        "Your conversations are never sent to any server",
+                        "Tes conversations ne sont jamais envoy\u{00E9}es \u{00E0} un serveur"
                     ))
                     .font(.caption)
                     .foregroundStyle(.secondary)

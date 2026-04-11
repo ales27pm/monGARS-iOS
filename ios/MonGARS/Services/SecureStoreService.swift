@@ -6,6 +6,11 @@ nonisolated enum SecureStoreKey: String, Sendable {
     case lastUsedLanguage = "last_used_language"
     case onboardingCompleted = "onboarding_completed"
     case modelDownloadToken = "model_download_token"
+    case networkToolsEnabled = "network_tools_enabled"
+    case allowWebSearch = "allow_web_search"
+    case allowWeather = "allow_weather"
+    case askBeforeNetworkUse = "ask_before_network_use"
+    case offlineMode = "offline_mode"
 }
 
 actor SecureStoreService {
