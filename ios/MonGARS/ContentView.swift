@@ -53,22 +53,12 @@ struct ContentView: View {
                     }
                 }
                 .onChange(of: modelDownloadManager.llmState) { _, newState in
-                    if newState.isInstalled || newState.isInstalledPartially {
-                        if let coordinator = runtimeCoordinator, !coordinator.llmReady {
-                            Task {
-                                await coordinator.loadLLMIfAvailable()
-                            }
-                        }
-                    }
+                    guard let coordinator = runtimeCoordinator else { return }
+                    coordinator.enqueueLLMTransition(newState)
                 }
                 .onChange(of: modelDownloadManager.embeddingState) { _, newState in
-                    if newState.isInstalled {
-                        if let coordinator = runtimeCoordinator, !coordinator.embeddingReady {
-                            Task {
-                                await coordinator.loadEmbeddingIfAvailable()
-                            }
-                        }
-                    }
+                    guard let coordinator = runtimeCoordinator else { return }
+                    coordinator.enqueueEmbeddingTransition(newState)
                 }
                 .onChange(of: modelDownloadManager.selectedChatSourceID) { _, _ in
                     guard let coordinator = runtimeCoordinator else { return }

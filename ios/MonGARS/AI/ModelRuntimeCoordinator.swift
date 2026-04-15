@@ -42,6 +42,8 @@ final class ModelRuntimeCoordinator {
     private var thermalObserver: NSObjectProtocol?
     private var chatReloadTask: Task<Void, Never>?
     private var embeddingReloadTask: Task<Void, Never>?
+    private var llmTransitionTask: Task<Void, Never>?
+    private var embeddingTransitionTask: Task<Void, Never>?
 
     init(modelDownloadManager: ModelDownloadManager) {
         let diag = InferenceDiagnostics()
@@ -168,6 +170,56 @@ final class ModelRuntimeCoordinator {
     func loadAllAvailable() async {
         await loadLLMIfAvailable()
         await loadEmbeddingIfAvailable()
+    }
+
+    func handleLLMStateTransition(_ newState: ModelDownloadState) async {
+        guard !Task.isCancelled else { return }
+        if newState.isInstalled || newState.isInstalledPartially {
+            if !llmReady {
+                await loadLLMIfAvailable()
+            }
+            return
+        }
+
+        await llmEngine.unloadModel()
+        llmReady = false
+        clearLLMFailureState()
+
+        if newState.isDownloading || newState.isInstalling {
+            runtimeState = .degraded("LLM model download in progress")
+        } else {
+            runtimeState = .degraded("LLM model not downloaded")
+        }
+    }
+
+    func handleEmbeddingStateTransition(_ newState: ModelDownloadState) async {
+        guard !Task.isCancelled else { return }
+        if newState.isInstalled {
+            if !embeddingReady {
+                await loadEmbeddingIfAvailable()
+            }
+            return
+        }
+
+        await embeddingEngine.unloadModel()
+        embeddingReady = false
+        updateRuntimeState()
+    }
+
+    func enqueueLLMTransition(_ newState: ModelDownloadState) {
+        llmTransitionTask?.cancel()
+        llmTransitionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.handleLLMStateTransition(newState)
+        }
+    }
+
+    func enqueueEmbeddingTransition(_ newState: ModelDownloadState) {
+        embeddingTransitionTask?.cancel()
+        embeddingTransitionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.handleEmbeddingStateTransition(newState)
+        }
     }
 
     func requestChatReloadForSelectionChange() {

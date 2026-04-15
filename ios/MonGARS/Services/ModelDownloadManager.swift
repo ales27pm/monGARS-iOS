@@ -5,6 +5,9 @@ import os
 @Observable
 @MainActor
 final class ModelDownloadManager {
+    private static let installMarkerFileName = ".install-complete.json"
+    private static let installMarkerDateFormatter = ISO8601DateFormatter()
+
     var llmState: ModelDownloadState = .notDownloaded
     var embeddingState: ModelDownloadState = .notDownloaded
     var selectedChatSourceID: ModelSourceID = ModelSourceCatalog.defaultChatSourceID
@@ -140,20 +143,10 @@ final class ModelDownloadManager {
     func modelFileURL(for sourceID: ModelSourceID) -> URL? {
         let dir = modelDirectory(for: sourceID)
         guard fileManager.fileExists(atPath: dir.path) else { return nil }
-
-        if let contents = try? fileManager.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
-            if let compiled = contents.first(where: { $0.pathExtension == "mlmodelc" }) {
-                return compiled
-            }
-            if let pkg = contents.first(where: { $0.pathExtension == "mlpackage" }) {
-                return pkg
-            }
-            if let mlmodel = contents.first(where: { $0.pathExtension == "mlmodel" }) {
-                return mlmodel
-            }
+        if let source = ModelSourceCatalog.source(for: sourceID) {
+            return resolveModelArtifactURL(for: source, in: dir)
         }
-
-        return nil
+        return resolveModelArtifactURLInDirectory(dir)
     }
 
     func tokenizerDirectory(for sourceID: ModelSourceID) -> URL? {
@@ -309,6 +302,7 @@ final class ModelDownloadManager {
 
             try validateInstall(modelDir: destDir, source: source)
             try excludeFromBackup(destDir)
+            writeInstallMarkerBestEffort(for: source, in: destDir, context: "archive-install")
 
             try? fileManager.removeItem(at: stagingDir)
             try? fileManager.removeItem(at: archiveURL)
@@ -407,6 +401,7 @@ final class ModelDownloadManager {
 
             try validateInstall(modelDir: destDir, source: source)
             try excludeFromBackup(destDir)
+            writeInstallMarkerBestEffort(for: source, in: destDir, context: "repo-install")
 
             currentInstallPhase = .complete
             let hasTokenizer = tokResult.filesDownloaded.contains("tokenizer.json")
@@ -665,17 +660,14 @@ final class ModelDownloadManager {
             throw ModelInstallError.validationFailed("Model directory does not exist")
         }
 
+        try validateExpectedArtifactLocation(modelDir: modelDir, source: source)
+
         guard let contents = try? fileManager.contentsOfDirectory(at: modelDir, includingPropertiesForKeys: nil),
               !contents.isEmpty else {
             throw ModelInstallError.validationFailed("Model directory is empty")
         }
 
-        let hasModel = contents.contains { url in
-            let ext = url.pathExtension
-            return ext == "mlmodelc" || ext == "mlpackage" || ext == "mlmodel"
-        }
-
-        guard hasModel else {
+        guard resolveModelArtifactURL(for: source, in: modelDir) != nil else {
             throw ModelInstallError.validationFailed("No Core ML model found in install directory")
         }
 
@@ -683,6 +675,24 @@ final class ModelDownloadManager {
         let minimumExpected = source.estimatedSizeBytes / 20
         guard dirSize > minimumExpected else {
             throw ModelInstallError.validationFailed("Installed model appears too small (\(dirSize) bytes, expected at least \(minimumExpected))")
+        }
+    }
+
+    private func validateExpectedArtifactLocation(modelDir: URL, source: ModelSource) throws {
+        switch source.downloadStrategy {
+        case .repoDirectory(let modelPath):
+            let expectedURL = modelDir.appendingPathComponent(modelPath)
+            var isDir: ObjCBool = false
+            guard fileManager.fileExists(atPath: expectedURL.path, isDirectory: &isDir) else {
+                throw ModelInstallError.validationFailed("Expected model artifact is missing at \(modelPath)")
+            }
+            if source.artifactType != .zipArchive && !isDir.boolValue {
+                throw ModelInstallError.validationFailed("Expected model artifact path is not a directory: \(modelPath)")
+            }
+        case .archive:
+            break
+        case .unsupported:
+            break
         }
     }
 
@@ -768,6 +778,7 @@ final class ModelDownloadManager {
 
         do {
             try validateInstall(modelDir: dir, source: source)
+            backfillInstallMarkerIfNeeded(for: source, at: dir, context: "refresh")
             let hasTok = hasTokenizer(for: source.id)
             updateState(for: source.id, state: hasTok ? .installed : .installedMissingTokenizer)
         } catch {
@@ -789,6 +800,7 @@ final class ModelDownloadManager {
             if let src = ModelSourceCatalog.source(for: sourceID) {
                 do {
                     try validateInstall(modelDir: dir, source: src)
+                    backfillInstallMarkerIfNeeded(for: src, at: dir, context: "state-check")
                     let hasTok = hasTokenizer(for: sourceID)
                     return hasTok ? .installed : .installedMissingTokenizer
                 } catch {
@@ -856,6 +868,66 @@ final class ModelDownloadManager {
             try fileManager.removeItem(at: url)
         }
         try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
+    }
+
+    private func hasInstallMarker(in modelDir: URL) -> Bool {
+        let markerURL = modelDir.appendingPathComponent(Self.installMarkerFileName)
+        return fileManager.fileExists(atPath: markerURL.path)
+    }
+
+    private func writeInstallMarker(for source: ModelSource, in modelDir: URL) throws {
+        let markerURL = modelDir.appendingPathComponent(Self.installMarkerFileName)
+        let payload: [String: String] = [
+            "sourceID": source.id,
+            "completedAt": Self.installMarkerDateFormatter.string(from: Date()),
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: markerURL, options: .atomic)
+    }
+
+    private func backfillInstallMarkerIfNeeded(for source: ModelSource, at modelDir: URL, context: String) {
+        guard source.isAvailableForDownload, !hasInstallMarker(in: modelDir) else { return }
+        writeInstallMarkerBestEffort(for: source, in: modelDir, context: "backfill-\(context)")
+    }
+
+    private func writeInstallMarkerBestEffort(for source: ModelSource, in modelDir: URL, context: String) {
+        do {
+            try writeInstallMarker(for: source, in: modelDir)
+            logger.info("Install marker written (\(context)) for \(source.id)")
+        } catch {
+            logger.warning("Failed to write install marker (\(context)) for \(source.id): \(error.localizedDescription)")
+        }
+    }
+
+    private func resolveModelArtifactURL(for source: ModelSource, in modelDir: URL) -> URL? {
+        if case .repoDirectory(let modelPath) = source.downloadStrategy {
+            let expected = modelDir.appendingPathComponent(modelPath)
+            if fileManager.fileExists(atPath: expected.path), isModelArtifactURL(expected) {
+                return expected
+            }
+        }
+        return resolveModelArtifactURLInDirectory(modelDir)
+    }
+
+    private func resolveModelArtifactURLInDirectory(_ modelDir: URL) -> URL? {
+        if let contents = try? fileManager.contentsOfDirectory(at: modelDir, includingPropertiesForKeys: nil) {
+            if let topLevelArtifact = contents.first(where: { isModelArtifactURL($0) }) {
+                return topLevelArtifact
+            }
+        }
+
+        let enumerator = fileManager.enumerator(at: modelDir, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
+        while let url = enumerator?.nextObject() as? URL {
+            if isModelArtifactURL(url) {
+                return url
+            }
+        }
+        return nil
+    }
+
+    private func isModelArtifactURL(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return ext == "mlmodelc" || ext == "mlpackage" || ext == "mlmodel"
     }
 
     private func excludeFromBackup(_ url: URL) throws {
