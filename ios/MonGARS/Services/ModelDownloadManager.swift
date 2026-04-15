@@ -8,6 +8,54 @@ final class ModelDownloadManager {
     private static let installMarkerFileName = ".install-complete.json"
     private static let installMarkerDateFormatter = ISO8601DateFormatter()
 
+    @preconcurrency
+    private final class SessionDelegateProxy: NSObject, URLSessionDownloadDelegate, URLSessionTaskDelegate, @unchecked Sendable {
+        weak var owner: ModelDownloadManager?
+
+        init(owner: ModelDownloadManager) {
+            self.owner = owner
+        }
+
+        nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+            Task { @MainActor [weak owner] in
+                owner?.handleDownloadProgress(taskIdentifier: downloadTask.taskIdentifier, totalBytesWritten: totalBytesWritten, totalBytesExpected: totalBytesExpectedToWrite)
+            }
+        }
+
+        nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+            Task { @MainActor [weak owner] in
+                owner?.handleTaskFinishedDownloading(taskIdentifier: downloadTask.taskIdentifier, location: location)
+            }
+        }
+
+        nonisolated func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            Task { @MainActor [weak owner] in
+                owner?.handleTaskCompletion(task: task, error: error)
+            }
+        }
+    }
+
+    private struct DownloadResumeKey: Hashable, Sendable {
+        let sourceID: ModelSourceID
+        let remoteURL: String
+    }
+
+    private enum DownloadProgressMode: Sendable {
+        case sourceOnly
+        case cumulative(totalExpectedBytes: Int64, completedBytesBeforeCurrentTask: Int64)
+    }
+
+    private struct TaskRouting {
+        let sourceID: ModelSourceID
+        let resumeKey: DownloadResumeKey
+        let progressMode: DownloadProgressMode
+    }
+
+    private enum DownloadTaskResult {
+        case success(tempURL: URL, response: URLResponse?)
+        case failure(error: Error, resumeData: Data?)
+    }
+
     var llmState: ModelDownloadState = .notDownloaded
     var embeddingState: ModelDownloadState = .notDownloaded
     var selectedChatSourceID: ModelSourceID = ModelSourceCatalog.defaultChatSourceID
@@ -17,10 +65,25 @@ final class ModelDownloadManager {
     var lastDiagnosticMessage: String?
     var lastTokenizerFallbackResult: TokenizerFallbackResult?
 
-    private var activeTasks: [ModelSourceID: URLSessionDownloadTask] = [:]
-    private var progressObservations: [ModelSourceID: NSKeyValueObservation] = [:]
-    private let logger = Logger(subsystem: "com.mongars.models", category: "download")
-    private let fileManager = FileManager.default
+    @ObservationIgnored private var activeTasks: [ModelSourceID: URLSessionDownloadTask] = [:]
+    @ObservationIgnored private var taskToSourceID: [Int: ModelSourceID] = [:]
+    @ObservationIgnored private var taskRouting: [Int: TaskRouting] = [:]
+    @ObservationIgnored private var taskTempFiles: [Int: URL] = [:]
+    @ObservationIgnored private var taskContinuations: [Int: CheckedContinuation<DownloadTaskResult, Never>] = [:]
+    @ObservationIgnored private var resumeDataStore: [DownloadResumeKey: Data] = [:]
+    @ObservationIgnored private var cancelledSources: Set<ModelSourceID> = []
+    @ObservationIgnored private let retryPlanner = DownloadRetryPlanner()
+    @ObservationIgnored private let logger = Logger(subsystem: "com.mongars.models", category: "download")
+    @ObservationIgnored private let fileManager = FileManager.default
+    @ObservationIgnored private lazy var sessionDelegate = SessionDelegateProxy(owner: self)
+    @ObservationIgnored private lazy var downloadSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = true
+        configuration.timeoutIntervalForRequest = 60
+        configuration.timeoutIntervalForResource = 24 * 60 * 60
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: configuration, delegate: sessionDelegate, delegateQueue: nil)
+    }()
 
     init() {
         do {
@@ -67,6 +130,8 @@ final class ModelDownloadManager {
             return
         }
 
+        cancelledSources.remove(sourceID)
+
         guard source.isAvailableForDownload else {
             if case .unsupported(let reason) = source.downloadStrategy {
                 updateState(for: sourceID, state: .unavailable(reason))
@@ -81,25 +146,37 @@ final class ModelDownloadManager {
             return
         }
 
-        updateState(for: sourceID, state: .downloading(progress: 0))
+        if let existingTask = activeTasks[sourceID] {
+            existingTask.cancel()
+        }
+
+        updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .started))
         currentInstallPhase = .preflight
 
-        Task {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
             switch source.downloadStrategy {
             case .archive(let filename):
-                guard let url = source.hfResolveURL(path: filename) else {
+                let urls = source.hfResolveURLs(path: filename)
+                guard !urls.isEmpty else {
                     updateState(for: sourceID, state: .error(DownloadDiagnosticError.noDownloadURL(sourceID: sourceID).userMessage))
                     return
                 }
-                let preflightOK = await preflightCheck(url: url, sourceID: sourceID)
+                let preflightOK = await preflightCheck(urls: urls, sourceID: sourceID)
                 guard preflightOK else { return }
+                guard !isSourceCancelled(sourceID) else {
+                    updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .cancelled))
+                    currentInstallPhase = nil
+                    overallPhase = nil
+                    return
+                }
                 currentInstallPhase = .downloading
                 if source.isChat {
                     overallPhase = .llmDownload
                 } else {
                     overallPhase = .embeddingDownload
                 }
-                beginArchiveDownload(url: url, sourceID: sourceID)
+                await beginArchiveDownload(urls: urls, sourceID: sourceID)
 
             case .repoDirectory(let modelPath):
                 if source.isChat {
@@ -126,18 +203,30 @@ final class ModelDownloadManager {
     }
 
     func cancelDownload(sourceID: ModelSourceID) {
-        activeTasks[sourceID]?.cancel()
-        activeTasks.removeValue(forKey: sourceID)
-        progressObservations.removeValue(forKey: sourceID)
+        cancelledSources.insert(sourceID)
+
+        if let task = activeTasks[sourceID] {
+            let taskID = task.taskIdentifier
+            let resumeKey = taskRouting[taskID]?.resumeKey
+            task.cancel { [weak self] resumeData in
+                guard let self, let resumeData, let resumeKey else { return }
+                Task { @MainActor [weak self] in
+                    self?.resumeDataStore[resumeKey] = resumeData
+                }
+            }
+        }
+
         currentInstallPhase = nil
         overallPhase = nil
-        updateState(for: sourceID, state: .notDownloaded)
+        updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .cancelled))
     }
 
     func deleteModel(sourceID: ModelSourceID) {
+        cancelDownload(sourceID: sourceID)
+        clearResumeData(for: sourceID)
         let modelDir = modelDirectory(for: sourceID)
         try? fileManager.removeItem(at: modelDir)
-        updateState(for: sourceID, state: .notDownloaded)
+        updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .cancelled))
         logger.info("Model deleted: \(sourceID)")
     }
 
@@ -187,92 +276,128 @@ final class ModelDownloadManager {
 
     // MARK: - Preflight
 
-    private func preflightCheck(url: URL, sourceID: ModelSourceID) async -> Bool {
-        logger.info("Preflight: checking \(url.absoluteString)")
-        lastDiagnosticMessage = "Preflight: \(url.absoluteString)"
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "HEAD"
-        request.timeoutInterval = 15
-
-        do {
-            let (_, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                updateState(for: sourceID, state: .error("Preflight: non-HTTP response"))
-                return false
-            }
-
-            let finalURL = http.url ?? url
-            logger.info("Preflight resolved URL: \(finalURL.absoluteString), status: \(http.statusCode)")
-
-            if (200...399).contains(http.statusCode) {
-                return true
-            }
-
-            let diagError = classifyHTTPError(statusCode: http.statusCode, url: finalURL.absoluteString, bodyPreview: "")
-            let msg = diagError.userMessage
-            updateState(for: sourceID, state: .error(msg))
-            lastDiagnosticMessage = msg
-            return false
-        } catch {
-            let msg = DownloadDiagnosticError.preflightUnreachable(url: url.absoluteString, underlyingError: error.localizedDescription).userMessage
-            updateState(for: sourceID, state: .error(msg))
-            lastDiagnosticMessage = msg
+    private func preflightCheck(urls: [URL], sourceID: ModelSourceID) async -> Bool {
+        guard !urls.isEmpty else {
+            let message = DownloadDiagnosticError.noDownloadURL(sourceID: sourceID).userMessage
+            updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: message)))
+            lastDiagnosticMessage = message
             return false
         }
+
+        var lastFailureMessage: String?
+
+        for (index, url) in urls.enumerated() {
+            logger.info("Preflight: checking \(url.absoluteString)")
+            lastDiagnosticMessage = "Preflight: \(url.absoluteString)"
+
+            var request = URLRequest(url: url)
+            request.httpMethod = "HEAD"
+            request.timeoutInterval = 15
+
+            do {
+                let (_, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    lastFailureMessage = "Preflight: non-HTTP response"
+                    continue
+                }
+
+                let finalURL = http.url ?? url
+                logger.info("Preflight resolved URL: \(finalURL.absoluteString), status: \(http.statusCode)")
+
+                if (200...399).contains(http.statusCode) {
+                    return true
+                }
+
+                let diagError = classifyHTTPError(statusCode: http.statusCode, url: finalURL.absoluteString, bodyPreview: "")
+                lastFailureMessage = diagError.userMessage
+
+                let hasFallback = index + 1 < urls.count
+                let action = retryPlanner.nextAction(for: .httpStatus(http.statusCode), retryCountOnCurrentURL: retryPlanner.maxRetriesPerURL, hasFallbackURL: hasFallback)
+                if case .switchToFallbackURL = action {
+                    logger.warning("Preflight switching to fallback URL for \(sourceID) after HTTP \(http.statusCode)")
+                    continue
+                }
+                if case .retry = action {
+                    // Transient responses are handled in the download loop with backoff.
+                    return true
+                }
+
+                updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: diagError.userMessage)))
+                lastDiagnosticMessage = diagError.userMessage
+                return false
+            } catch {
+                let failureKind = downloadFailureKind(from: error)
+                let hasFallback = index + 1 < urls.count
+                let action = retryPlanner.nextAction(for: failureKind, retryCountOnCurrentURL: retryPlanner.maxRetriesPerURL, hasFallbackURL: hasFallback)
+
+                if failureKind == .transientNetwork {
+                    // Continue into the normal download flow so retries/resume logic can recover.
+                    return true
+                }
+
+                if case .switchToFallbackURL = action {
+                    logger.warning("Preflight switching to fallback URL for \(sourceID) after error: \(error.localizedDescription)")
+                    continue
+                }
+
+                if failureKind == .cancelled {
+                    updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .cancelled))
+                    return false
+                }
+
+                let message = DownloadDiagnosticError.preflightUnreachable(url: url.absoluteString, underlyingError: error.localizedDescription).userMessage
+                updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: message)))
+                lastDiagnosticMessage = message
+                return false
+            }
+        }
+
+        let finalMessage = lastFailureMessage ?? DownloadDiagnosticError.noDownloadURL(sourceID: sourceID).userMessage
+        updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: finalMessage)))
+        lastDiagnosticMessage = finalMessage
+        return false
     }
 
     // MARK: - Archive Download
 
-    private func beginArchiveDownload(url: URL, sourceID: ModelSourceID) {
-        logger.info("Starting archive download: \(url.absoluteString) for \(sourceID)")
-
-        let task = URLSession.shared.downloadTask(with: url) { [weak self] tempURL, response, error in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.progressObservations.removeValue(forKey: sourceID)
-                self.activeTasks.removeValue(forKey: sourceID)
-
-                if let error {
-                    if (error as NSError).code == NSURLErrorCancelled {
-                        self.updateState(for: sourceID, state: .notDownloaded)
-                    } else {
-                        self.updateState(for: sourceID, state: .error("Download error: \(error.localizedDescription)"))
-                    }
-                    self.currentInstallPhase = nil
-                    return
-                }
-
-                guard let tempURL else {
-                    self.updateState(for: sourceID, state: .error("Download failed: no file received"))
-                    self.currentInstallPhase = nil
-                    return
-                }
-
-                if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-                    let bodyPreview = self.readBodyPreview(from: tempURL)
-                    let finalURL = http.url?.absoluteString ?? url.absoluteString
-                    let diagError = self.classifyHTTPError(statusCode: http.statusCode, url: finalURL, bodyPreview: bodyPreview)
-                    self.updateState(for: sourceID, state: .error(diagError.userMessage))
-                    self.lastDiagnosticMessage = diagError.userMessage
-                    self.currentInstallPhase = nil
-                    try? self.fileManager.removeItem(at: tempURL)
-                    return
-                }
-
-                self.updateState(for: sourceID, state: .installing)
-                await self.installArchive(archiveURL: tempURL, sourceID: sourceID)
-            }
+    private func beginArchiveDownload(urls: [URL], sourceID: ModelSourceID) async {
+        guard !isSourceCancelled(sourceID) else {
+            updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .cancelled))
+            currentInstallPhase = nil
+            overallPhase = nil
+            return
         }
 
-        let observation = task.progress.observe(\.fractionCompleted, options: [.new]) { [weak self] progress, _ in
-            Task { @MainActor [weak self] in
-                self?.updateState(for: sourceID, state: .downloading(progress: progress.fractionCompleted))
+        logger.info("Starting archive download for \(sourceID) with \(urls.count) candidate URL(s)")
+
+        do {
+            let archiveURL = try await downloadFileStreaming(
+                sourceID: sourceID,
+                candidateURLs: urls,
+                progressMode: .sourceOnly
+            )
+
+            guard !isSourceCancelled(sourceID) else {
+                try? fileManager.removeItem(at: archiveURL)
+                updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .cancelled))
+                currentInstallPhase = nil
+                overallPhase = nil
+                return
             }
+
+            updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .beginInstall))
+            await installArchive(archiveURL: archiveURL, sourceID: sourceID)
+        } catch is CancellationError {
+            updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .cancelled))
+            currentInstallPhase = nil
+            overallPhase = nil
+        } catch {
+            let message = errorMessage(from: error, defaultPrefix: "Download error")
+            updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: message)))
+            lastDiagnosticMessage = message
+            currentInstallPhase = nil
+            overallPhase = nil
         }
-        progressObservations[sourceID] = observation
-        activeTasks[sourceID] = task
-        task.resume()
     }
 
     private func installArchive(archiveURL: URL, sourceID: ModelSourceID) async {
@@ -315,14 +440,16 @@ final class ModelDownloadManager {
 
             try? fileManager.removeItem(at: stagingDir)
             try? fileManager.removeItem(at: archiveURL)
+            clearResumeData(for: sourceID)
 
             currentInstallPhase = .complete
             let hasTokenizer = tokResult.filesDownloaded.contains("tokenizer.json")
-            updateState(for: sourceID, state: hasTokenizer ? .installed : .installedMissingTokenizer)
+            updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .success(hasTokenizer: hasTokenizer)))
             logger.info("Archive model installed: \(sourceID)")
         } catch {
             try? fileManager.removeItem(at: stagingDir)
-            updateState(for: sourceID, state: .error("Install failed: \(error.localizedDescription)"))
+            clearResumeData(for: sourceID)
+            updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: "Install failed: \(error.localizedDescription)")))
         }
 
         currentInstallPhase = nil
@@ -333,22 +460,31 @@ final class ModelDownloadManager {
     private func downloadRepoDirectory(source: ModelSource, modelPath: String) async {
         let sourceID = source.id
 
-        guard let treeURL = source.hfTreeURL(path: modelPath) else {
+        let treeURLs = source.hfTreeURLs(path: modelPath)
+        guard !treeURLs.isEmpty else {
             updateState(for: sourceID, state: .error("Invalid tree URL for \(sourceID)"))
             currentInstallPhase = nil
             return
         }
 
-        logger.info("Listing HF directory: \(treeURL.absoluteString)")
-        lastDiagnosticMessage = "Listing files: \(treeURL.absoluteString)"
+        logger.info("Listing HF directory candidates for \(sourceID): \(treeURLs.count)")
+        if let firstTreeURL = treeURLs.first {
+            lastDiagnosticMessage = "Listing files: \(firstTreeURL.absoluteString)"
+        }
 
         do {
             currentInstallPhase = .preflight
 
-            let preflightOK = await preflightCheckTree(treeURL: treeURL, sourceID: sourceID)
+            let preflightOK = await preflightCheckTree(treeURLs: treeURLs, sourceID: sourceID)
             guard preflightOK else { return }
+            guard !isSourceCancelled(sourceID) else {
+                updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .cancelled))
+                currentInstallPhase = nil
+                overallPhase = nil
+                return
+            }
 
-            let fileEntries = try await listHFDirectory(treeURL: treeURL)
+            let fileEntries = try await listHFDirectory(treeURLs: treeURLs, sourceID: sourceID)
             guard !fileEntries.isEmpty else {
                 updateState(for: sourceID, state: .error("No files found in model directory on HuggingFace"))
                 currentInstallPhase = nil
@@ -369,13 +505,15 @@ final class ModelDownloadManager {
             var downloadedBytes: Int64 = 0
 
             for entry in fileEntries {
-                if Task.isCancelled {
-                    updateState(for: sourceID, state: .notDownloaded)
+                if Task.isCancelled || isSourceCancelled(sourceID) {
+                    updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .cancelled))
                     currentInstallPhase = nil
+                    overallPhase = nil
                     return
                 }
 
-                guard let fileURL = source.hfResolveURL(path: entry.path) else { continue }
+                let fileURLs = source.hfResolveURLs(path: entry.path)
+                guard !fileURLs.isEmpty else { continue }
 
                 let relativePath = entry.path.replacingOccurrences(of: modelPath + "/", with: "")
                 let localFile = modelArtifactDir.appendingPathComponent(relativePath)
@@ -385,12 +523,17 @@ final class ModelDownloadManager {
                     try fileManager.createDirectory(at: localDir, withIntermediateDirectories: true)
                 }
 
-                try await downloadFileStreaming(from: fileURL, to: localFile)
+                try await downloadFileStreaming(
+                    sourceID: sourceID,
+                    candidateURLs: fileURLs,
+                    to: localFile,
+                    progressMode: .cumulative(totalExpectedBytes: totalBytes, completedBytesBeforeCurrentTask: downloadedBytes)
+                )
                 let fileSize = (try? localFile.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
                 downloadedBytes += Int64(fileSize)
 
                 let progress = totalBytes > 0 ? Double(downloadedBytes) / Double(totalBytes) : 0
-                updateState(for: sourceID, state: .downloading(progress: min(progress, 0.99)))
+                updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .progress(min(progress, 0.99))))
             }
 
             currentInstallPhase = .installingTokenizer
@@ -414,95 +557,212 @@ final class ModelDownloadManager {
 
             currentInstallPhase = .complete
             let hasTokenizer = tokResult.filesDownloaded.contains("tokenizer.json")
-            updateState(for: sourceID, state: hasTokenizer ? .installed : .installedMissingTokenizer)
+            clearResumeData(for: sourceID)
+            updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .success(hasTokenizer: hasTokenizer)))
             logger.info("Repo directory model installed: \(sourceID)")
+        } catch is CancellationError {
+            let destDir = modelDirectory(for: sourceID)
+            try? fileManager.removeItem(at: destDir)
+            updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .cancelled))
+            logger.info("Repo directory install cancelled for \(sourceID)")
         } catch {
             let destDir = modelDirectory(for: sourceID)
             try? fileManager.removeItem(at: destDir)
-            updateState(for: sourceID, state: .error("Install failed: \(error.localizedDescription)"))
-            logger.error("Repo directory install failed for \(sourceID): \(error.localizedDescription)")
+            clearResumeData(for: sourceID)
+            let message = errorMessage(from: error, defaultPrefix: "Install failed")
+            updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: message)))
+            lastDiagnosticMessage = message
+            logger.error("Repo directory install failed for \(sourceID): \(message, privacy: .public)")
         }
 
         currentInstallPhase = nil
     }
 
-    private func preflightCheckTree(treeURL: URL, sourceID: ModelSourceID) async -> Bool {
-        logger.info("Preflight tree: \(treeURL.absoluteString)")
-        lastDiagnosticMessage = "Verifying artifact: \(treeURL.absoluteString)"
+    private func preflightCheckTree(treeURLs: [URL], sourceID: ModelSourceID) async -> Bool {
+        guard !treeURLs.isEmpty else {
+            updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: "Invalid tree URL for \(sourceID)")))
+            currentInstallPhase = nil
+            return false
+        }
 
-        do {
-            var request = URLRequest(url: treeURL)
-            request.httpMethod = "GET"
-            request.timeoutInterval = 15
+        var lastFailureMessage: String?
 
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                updateState(for: sourceID, state: .error("Preflight: non-HTTP response"))
-                currentInstallPhase = nil
-                return false
-            }
+        for (index, treeURL) in treeURLs.enumerated() {
+            let recursiveURL = recursiveTreeURL(for: treeURL)
+            logger.info("Preflight tree: \(recursiveURL.absoluteString)")
+            lastDiagnosticMessage = "Verifying artifact: \(recursiveURL.absoluteString)"
 
-            let finalURL = http.url ?? treeURL
+            do {
+                var request = URLRequest(url: recursiveURL)
+                request.httpMethod = "GET"
+                request.timeoutInterval = 15
 
-            if (200...299).contains(http.statusCode) {
-                if let jsonArray = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]], !jsonArray.isEmpty {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    lastFailureMessage = "Preflight: non-HTTP response"
+                    continue
+                }
+
+                let finalURL = http.url ?? recursiveURL
+
+                if (200...299).contains(http.statusCode) {
+                    if let jsonArray = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]], !jsonArray.isEmpty {
+                        return true
+                    }
+                    lastFailureMessage = "Artifact directory is empty or invalid at \(finalURL.absoluteString)"
+                    continue
+                }
+
+                let bodyPreview = String(data: data.prefix(300), encoding: .utf8) ?? ""
+                let diagError = classifyHTTPError(statusCode: http.statusCode, url: finalURL.absoluteString, bodyPreview: bodyPreview)
+                lastFailureMessage = diagError.userMessage
+
+                let hasFallback = index + 1 < treeURLs.count
+                let action = retryPlanner.nextAction(for: .httpStatus(http.statusCode), retryCountOnCurrentURL: retryPlanner.maxRetriesPerURL, hasFallbackURL: hasFallback)
+                if case .switchToFallbackURL = action {
+                    logger.warning("Preflight tree switching to fallback URL for \(sourceID) after HTTP \(http.statusCode)")
+                    continue
+                }
+                if case .retry = action {
+                    // Defer transient handling to directory-list retries.
                     return true
                 }
-                updateState(for: sourceID, state: .error("Artifact directory is empty or invalid at \(finalURL.absoluteString)"))
+
+                updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: diagError.userMessage)))
+                lastDiagnosticMessage = diagError.userMessage
+                currentInstallPhase = nil
+                return false
+            } catch {
+                let failureKind = downloadFailureKind(from: error)
+                let hasFallback = index + 1 < treeURLs.count
+                let action = retryPlanner.nextAction(for: failureKind, retryCountOnCurrentURL: retryPlanner.maxRetriesPerURL, hasFallbackURL: hasFallback)
+
+                if failureKind == .transientNetwork {
+                    return true
+                }
+
+                if case .switchToFallbackURL = action {
+                    logger.warning("Preflight tree switching to fallback URL for \(sourceID) after error: \(error.localizedDescription)")
+                    continue
+                }
+
+                if failureKind == .cancelled {
+                    updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .cancelled))
+                    currentInstallPhase = nil
+                    return false
+                }
+
+                let message = DownloadDiagnosticError.preflightUnreachable(url: recursiveURL.absoluteString, underlyingError: error.localizedDescription).userMessage
+                updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: message)))
+                lastDiagnosticMessage = message
                 currentInstallPhase = nil
                 return false
             }
-
-            let bodyPreview = String(data: data.prefix(300), encoding: .utf8) ?? ""
-            let diagError = classifyHTTPError(statusCode: http.statusCode, url: finalURL.absoluteString, bodyPreview: bodyPreview)
-            updateState(for: sourceID, state: .error(diagError.userMessage))
-            lastDiagnosticMessage = diagError.userMessage
-            currentInstallPhase = nil
-            return false
-        } catch {
-            let msg = DownloadDiagnosticError.preflightUnreachable(url: treeURL.absoluteString, underlyingError: error.localizedDescription).userMessage
-            updateState(for: sourceID, state: .error(msg))
-            lastDiagnosticMessage = msg
-            currentInstallPhase = nil
-            return false
         }
+
+        let finalMessage = lastFailureMessage ?? "Artifact directory is empty or invalid"
+        updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: finalMessage)))
+        lastDiagnosticMessage = finalMessage
+        currentInstallPhase = nil
+        return false
     }
 
-    private func listHFDirectory(treeURL: URL) async throws -> [HFFileEntry] {
-        let recursiveURL: URL
-        if treeURL.absoluteString.contains("recursive=true") {
-            recursiveURL = treeURL
-        } else {
-            let separator = treeURL.absoluteString.contains("?") ? "&" : "?"
-            recursiveURL = URL(string: treeURL.absoluteString + separator + "recursive=true") ?? treeURL
+    private func listHFDirectory(treeURLs: [URL], sourceID: ModelSourceID) async throws -> [HFFileEntry] {
+        guard !treeURLs.isEmpty else {
+            throw ModelInstallError.hfTreeListFailed("No tree URL candidates provided")
         }
 
-        logger.info("Listing HF directory (recursive): \(recursiveURL.absoluteString)")
-        let (data, response) = try await URLSession.shared.data(from: recursiveURL)
+        var currentIndex = 0
+        var retryCount = 0
+        var lastFailureMessage = "Unable to list model directory"
 
-        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            throw ModelInstallError.hfTreeListFailed("HTTP \(code) from \(recursiveURL.absoluteString)")
-        }
+        while currentIndex < treeURLs.count {
+            if isSourceCancelled(sourceID) || Task.isCancelled {
+                throw CancellationError()
+            }
 
-        guard let jsonArray = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            throw ModelInstallError.hfTreeListFailed("Invalid JSON from HF API")
-        }
+            let recursiveURL = recursiveTreeURL(for: treeURLs[currentIndex])
+            logger.info("Listing HF directory (recursive): \(recursiveURL.absoluteString)")
 
-        var entries: [HFFileEntry] = []
-        for item in jsonArray {
-            guard let type = item["type"] as? String,
-                  let path = item["path"] as? String else { continue }
+            do {
+                let (data, response) = try await URLSession.shared.data(from: recursiveURL)
+                guard let http = response as? HTTPURLResponse else {
+                    throw ModelInstallError.hfTreeListFailed("Non-HTTP response from \(recursiveURL.absoluteString)")
+                }
 
-            if type == "file" {
-                let lfsSize = (item["lfs"] as? [String: Any])?["size"] as? Int64
-                let directSize = item["size"] as? Int64
-                let size = lfsSize ?? directSize ?? 0
-                entries.append(HFFileEntry(path: path, size: size, type: type))
+                if (200...299).contains(http.statusCode) {
+                    guard let jsonArray = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+                        throw ModelInstallError.hfTreeListFailed("Invalid JSON from HF API")
+                    }
+
+                    var entries: [HFFileEntry] = []
+                    for item in jsonArray {
+                        guard let type = item["type"] as? String,
+                              let path = item["path"] as? String else { continue }
+
+                        if type == "file" {
+                            let lfsSize = (item["lfs"] as? [String: Any])?["size"] as? Int64
+                            let directSize = item["size"] as? Int64
+                            let size = lfsSize ?? directSize ?? 0
+                            entries.append(HFFileEntry(path: path, size: size, type: type))
+                        }
+                    }
+
+                    return entries
+                }
+
+                let bodyPreview = String(data: data.prefix(300), encoding: .utf8) ?? ""
+                let diagError = classifyHTTPError(statusCode: http.statusCode, url: recursiveURL.absoluteString, bodyPreview: bodyPreview)
+                lastFailureMessage = diagError.userMessage
+
+                let hasFallback = currentIndex + 1 < treeURLs.count
+                let action = retryPlanner.nextAction(for: .httpStatus(http.statusCode), retryCountOnCurrentURL: retryCount, hasFallbackURL: hasFallback)
+                switch action {
+                case .retry(let delay):
+                    retryCount += 1
+                    logger.warning("Retrying HF directory listing for \(sourceID) in \(delay, privacy: .public)s")
+                    try await sleepForRetry(delaySeconds: delay, sourceID: sourceID)
+                case .switchToFallbackURL:
+                    retryCount = 0
+                    if let nextIndex = DownloadURLSelector.nextIndex(after: .switchToFallbackURL, currentIndex: currentIndex, totalURLCount: treeURLs.count) {
+                        logger.warning("Switching HF directory listing to fallback URL for \(sourceID)")
+                        currentIndex = nextIndex
+                    } else {
+                        throw ModelInstallError.hfTreeListFailed(lastFailureMessage)
+                    }
+                case .fail:
+                    throw ModelInstallError.hfTreeListFailed(lastFailureMessage)
+                }
+            } catch {
+                if error is CancellationError {
+                    throw error
+                }
+
+                let failureKind = downloadFailureKind(from: error)
+                let hasFallback = currentIndex + 1 < treeURLs.count
+                let action = retryPlanner.nextAction(for: failureKind, retryCountOnCurrentURL: retryCount, hasFallbackURL: hasFallback)
+                lastFailureMessage = "HF directory list failed at \(recursiveURL.absoluteString): \(error.localizedDescription)"
+
+                switch action {
+                case .retry(let delay):
+                    retryCount += 1
+                    logger.warning("Retrying HF directory listing after error for \(sourceID) in \(delay, privacy: .public)s")
+                    try await sleepForRetry(delaySeconds: delay, sourceID: sourceID)
+                case .switchToFallbackURL:
+                    retryCount = 0
+                    if let nextIndex = DownloadURLSelector.nextIndex(after: .switchToFallbackURL, currentIndex: currentIndex, totalURLCount: treeURLs.count) {
+                        logger.warning("Switching HF directory listing to fallback URL after error for \(sourceID)")
+                        currentIndex = nextIndex
+                    } else {
+                        throw ModelInstallError.hfTreeListFailed(lastFailureMessage)
+                    }
+                case .fail:
+                    throw ModelInstallError.hfTreeListFailed(lastFailureMessage)
+                }
             }
         }
 
-        return entries
+        throw ModelInstallError.hfTreeListFailed(lastFailureMessage)
     }
 
     // MARK: - Tokenizer with Fallback Chain
@@ -836,18 +1096,283 @@ final class ModelDownloadManager {
 
     // MARK: - Streaming File Download
 
-    private func downloadFileStreaming(from url: URL, to localFile: URL) async throws {
-        let (tempURL, response) = try await URLSession.shared.download(from: url)
-        if let http = response as? HTTPURLResponse, !(200...399).contains(http.statusCode) {
-            let bodyPreview = readBodyPreview(from: tempURL)
-            try? fileManager.removeItem(at: tempURL)
-            let diagError = classifyHTTPError(statusCode: http.statusCode, url: url.absoluteString, bodyPreview: bodyPreview)
-            throw ModelInstallError.fileDownloadFailed(diagError.userMessage)
+    private func recursiveTreeURL(for treeURL: URL) -> URL {
+        if treeURL.absoluteString.contains("recursive=true") {
+            return treeURL
         }
+        let separator = treeURL.absoluteString.contains("?") ? "&" : "?"
+        return URL(string: treeURL.absoluteString + separator + "recursive=true") ?? treeURL
+    }
+
+    private func downloadFileStreaming(sourceID: ModelSourceID, candidateURLs: [URL], progressMode: DownloadProgressMode) async throws -> URL {
+        try await downloadRemoteFileWithRetry(sourceID: sourceID, candidateURLs: candidateURLs, progressMode: progressMode)
+    }
+
+    private func downloadFileStreaming(sourceID: ModelSourceID, candidateURLs: [URL], to localFile: URL, progressMode: DownloadProgressMode) async throws {
+        let tempURL = try await downloadRemoteFileWithRetry(sourceID: sourceID, candidateURLs: candidateURLs, progressMode: progressMode)
         if fileManager.fileExists(atPath: localFile.path) {
             try fileManager.removeItem(at: localFile)
         }
         try fileManager.moveItem(at: tempURL, to: localFile)
+    }
+
+    private func downloadRemoteFileWithRetry(sourceID: ModelSourceID, candidateURLs: [URL], progressMode: DownloadProgressMode) async throws -> URL {
+        guard !candidateURLs.isEmpty else {
+            throw ModelInstallError.fileDownloadFailed("No download URL provided")
+        }
+
+        var currentIndex = 0
+        var retryCount = 0
+        var lastFailureMessage = "Download failed."
+
+        while currentIndex < candidateURLs.count {
+            if isSourceCancelled(sourceID) || Task.isCancelled {
+                throw CancellationError()
+            }
+
+            let currentURL = candidateURLs[currentIndex]
+            let resumeKey = DownloadResumeKey(sourceID: sourceID, remoteURL: currentURL.absoluteString)
+            let resumeData = resumeDataStore[resumeKey]
+
+            let result = await enqueueDownloadTask(
+                sourceID: sourceID,
+                remoteURL: currentURL,
+                resumeData: resumeData,
+                resumeKey: resumeKey,
+                progressMode: progressMode
+            )
+
+            switch result {
+            case .success(let tempURL, let response):
+                if let http = response as? HTTPURLResponse, !(200...399).contains(http.statusCode) {
+                    let bodyPreview = readBodyPreview(from: tempURL)
+                    try? fileManager.removeItem(at: tempURL)
+                    let diagError = classifyHTTPError(statusCode: http.statusCode, url: currentURL.absoluteString, bodyPreview: bodyPreview)
+                    lastFailureMessage = diagError.userMessage
+
+                    let hasFallback = currentIndex + 1 < candidateURLs.count
+                    let action = retryPlanner.nextAction(for: .httpStatus(http.statusCode), retryCountOnCurrentURL: retryCount, hasFallbackURL: hasFallback)
+                    switch action {
+                    case .retry(let delay):
+                        retryCount += 1
+                        logger.warning("Retrying download for \(sourceID) in \(delay, privacy: .public)s after HTTP \(http.statusCode)")
+                        try await sleepForRetry(delaySeconds: delay, sourceID: sourceID)
+                    case .switchToFallbackURL:
+                        retryCount = 0
+                        resumeDataStore.removeValue(forKey: resumeKey)
+                        if let nextIndex = DownloadURLSelector.nextIndex(after: .switchToFallbackURL, currentIndex: currentIndex, totalURLCount: candidateURLs.count) {
+                            logger.warning("Switching download URL to fallback for \(sourceID) after HTTP \(http.statusCode)")
+                            currentIndex = nextIndex
+                        } else {
+                            throw ModelInstallError.fileDownloadFailed(lastFailureMessage)
+                        }
+                    case .fail:
+                        resumeDataStore.removeValue(forKey: resumeKey)
+                        throw ModelInstallError.fileDownloadFailed(lastFailureMessage)
+                    }
+                    continue
+                }
+
+                resumeDataStore.removeValue(forKey: resumeKey)
+                return tempURL
+
+            case .failure(let error, let resumeData):
+                if let resumeData {
+                    resumeDataStore[resumeKey] = resumeData
+                }
+
+                let failureKind = downloadFailureKind(from: error)
+                if failureKind == .cancelled || isSourceCancelled(sourceID) || Task.isCancelled {
+                    throw CancellationError()
+                }
+
+                lastFailureMessage = "Download failed for \(currentURL.absoluteString): \(error.localizedDescription)"
+                let hasFallback = currentIndex + 1 < candidateURLs.count
+                let action = retryPlanner.nextAction(for: failureKind, retryCountOnCurrentURL: retryCount, hasFallbackURL: hasFallback)
+
+                switch action {
+                case .retry(let delay):
+                    retryCount += 1
+                    logger.warning("Retrying download for \(sourceID) in \(delay, privacy: .public)s after error: \(error.localizedDescription, privacy: .public)")
+                    try await sleepForRetry(delaySeconds: delay, sourceID: sourceID)
+                case .switchToFallbackURL:
+                    retryCount = 0
+                    resumeDataStore.removeValue(forKey: resumeKey)
+                    if let nextIndex = DownloadURLSelector.nextIndex(after: .switchToFallbackURL, currentIndex: currentIndex, totalURLCount: candidateURLs.count) {
+                        logger.warning("Switching download URL to fallback for \(sourceID) after error: \(error.localizedDescription, privacy: .public)")
+                        currentIndex = nextIndex
+                    } else {
+                        throw ModelInstallError.fileDownloadFailed(lastFailureMessage)
+                    }
+                case .fail:
+                    resumeDataStore.removeValue(forKey: resumeKey)
+                    throw ModelInstallError.fileDownloadFailed(lastFailureMessage)
+                }
+            }
+        }
+
+        throw ModelInstallError.fileDownloadFailed(lastFailureMessage)
+    }
+
+    private func enqueueDownloadTask(
+        sourceID: ModelSourceID,
+        remoteURL: URL,
+        resumeData: Data?,
+        resumeKey: DownloadResumeKey,
+        progressMode: DownloadProgressMode
+    ) async -> DownloadTaskResult {
+        await withCheckedContinuation { continuation in
+            let task: URLSessionDownloadTask
+            if let resumeData, !resumeData.isEmpty {
+                task = downloadSession.downloadTask(withResumeData: resumeData)
+                logger.info("Resuming download task for \(sourceID) from stored resume data")
+            } else {
+                task = downloadSession.downloadTask(with: remoteURL)
+            }
+
+            let taskIdentifier = task.taskIdentifier
+            taskToSourceID[taskIdentifier] = sourceID
+            taskRouting[taskIdentifier] = TaskRouting(sourceID: sourceID, resumeKey: resumeKey, progressMode: progressMode)
+            taskContinuations[taskIdentifier] = continuation
+            activeTasks[sourceID] = task
+            task.resume()
+        }
+    }
+
+    private func handleDownloadProgress(taskIdentifier: Int, totalBytesWritten: Int64, totalBytesExpected: Int64) {
+        guard let routing = taskRouting[taskIdentifier] else { return }
+        guard !isSourceCancelled(routing.sourceID) else { return }
+
+        switch routing.progressMode {
+        case .sourceOnly:
+            guard totalBytesExpected > 0 else { return }
+            let progress = Double(totalBytesWritten) / Double(totalBytesExpected)
+            updateState(for: routing.sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(routing.sourceID), event: .progress(progress)))
+        case .cumulative(let totalExpectedBytes, let completedBytesBeforeCurrentTask):
+            let totalBytes = max(1, totalExpectedBytes)
+            let combinedWritten = completedBytesBeforeCurrentTask + max(0, totalBytesWritten)
+            let progress = Double(combinedWritten) / Double(totalBytes)
+            updateState(for: routing.sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(routing.sourceID), event: .progress(min(progress, 0.99))))
+        }
+    }
+
+    private func handleTaskFinishedDownloading(taskIdentifier: Int, location: URL) {
+        taskTempFiles[taskIdentifier] = location
+    }
+
+    private func handleTaskCompletion(task: URLSessionTask, error: Error?) {
+        let taskIdentifier = task.taskIdentifier
+        let continuation = taskContinuations[taskIdentifier]
+        let tempURL = taskTempFiles[taskIdentifier]
+
+        if let sourceID = taskToSourceID[taskIdentifier],
+           let activeTask = activeTasks[sourceID],
+           activeTask.taskIdentifier == taskIdentifier {
+            activeTasks.removeValue(forKey: sourceID)
+        }
+
+        cleanupTaskState(for: taskIdentifier)
+
+        guard let continuation else { return }
+
+        if let error {
+            let nsError = error as NSError
+            let resumeData = nsError.userInfo[NSURLSessionDownloadTaskResumeData] as? Data
+            continuation.resume(returning: .failure(error: error, resumeData: resumeData))
+            return
+        }
+
+        guard let tempURL else {
+            let unknownError = NSError(
+                domain: NSURLErrorDomain,
+                code: NSURLErrorUnknown,
+                userInfo: [NSLocalizedDescriptionKey: "Download completed without file location."]
+            )
+            continuation.resume(returning: .failure(error: unknownError, resumeData: nil))
+            return
+        }
+
+        continuation.resume(returning: .success(tempURL: tempURL, response: task.response))
+    }
+
+    private func cleanupTaskState(for taskIdentifier: Int) {
+        taskToSourceID.removeValue(forKey: taskIdentifier)
+        taskRouting.removeValue(forKey: taskIdentifier)
+        taskTempFiles.removeValue(forKey: taskIdentifier)
+        taskContinuations.removeValue(forKey: taskIdentifier)
+    }
+
+    private func clearResumeData(for sourceID: ModelSourceID) {
+        resumeDataStore = resumeDataStore.filter { $0.key.sourceID != sourceID }
+    }
+
+    private func sleepForRetry(delaySeconds: Double, sourceID: ModelSourceID) async throws {
+        let nanoseconds = UInt64(max(0, delaySeconds) * 1_000_000_000)
+        try await Task.sleep(nanoseconds: nanoseconds)
+        if isSourceCancelled(sourceID) || Task.isCancelled {
+            throw CancellationError()
+        }
+    }
+
+    private func isSourceCancelled(_ sourceID: ModelSourceID) -> Bool {
+        cancelledSources.contains(sourceID)
+    }
+
+    private func downloadFailureKind(from error: Error) -> DownloadFailureKind {
+        if error is CancellationError {
+            return .cancelled
+        }
+
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain {
+            switch nsError.code {
+            case NSURLErrorCancelled:
+                return .cancelled
+            case NSURLErrorTimedOut,
+                 NSURLErrorNetworkConnectionLost,
+                 NSURLErrorNotConnectedToInternet,
+                 NSURLErrorCannotFindHost,
+                 NSURLErrorCannotConnectToHost,
+                 NSURLErrorDNSLookupFailed,
+                 NSURLErrorInternationalRoamingOff,
+                 NSURLErrorCallIsActive,
+                 NSURLErrorDataNotAllowed,
+                 NSURLErrorResourceUnavailable,
+                 NSURLErrorCannotLoadFromNetwork:
+                return .transientNetwork
+            default:
+                break
+            }
+        }
+
+        return .other
+    }
+
+    private func errorMessage(from error: Error, defaultPrefix: String) -> String {
+        if let installError = error as? ModelInstallError {
+            switch installError {
+            case .extractionFailed(let message),
+                 .tokenizerDownloadFailed(let message),
+                 .tokenizerGated(let message),
+                 .validationFailed(let message),
+                 .notAvailableForDownload(let message),
+                 .preflightFailed(let message),
+                 .hfTreeListFailed(let message),
+                 .fileDownloadFailed(let message),
+                 .mlpackageInvalid(let message):
+                return message
+            case .invalidArchive:
+                return "\(defaultPrefix): Invalid archive format."
+            case .modelNotFoundInArchive:
+                return "\(defaultPrefix): No Core ML model found in the archive."
+            case .insufficientSpace:
+                return "\(defaultPrefix): Insufficient storage space."
+            case .stagingCleanupFailed:
+                return "\(defaultPrefix): Failed to clean staging directory."
+            }
+        }
+
+        return "\(defaultPrefix): \(error.localizedDescription)"
     }
 
     // MARK: - Utilities

@@ -34,6 +34,7 @@ nonisolated struct ModelSource: Sendable, Identifiable {
     let artifactType: ArtifactType
     let tokenizerFiles: [String]
     let configFiles: [String]
+    let downloadFallbackRepoIDs: [String]
     let tokenizerRepoID: String?
     let tokenizerFallbackRepoIDs: [String]
     let requiresAuth: Bool
@@ -82,6 +83,12 @@ nonisolated struct ModelSource: Sendable, Identifiable {
         return repos
     }
 
+    var allDownloadRepoIDs: [String] {
+        var repos: [String] = [repoID]
+        repos.append(contentsOf: downloadFallbackRepoIDs)
+        return repos
+    }
+
     var formatLabel: String {
         switch promptFormat {
         case .llama3: "Llama"
@@ -94,6 +101,12 @@ nonisolated struct ModelSource: Sendable, Identifiable {
         URL(string: "https://huggingface.co/\(repoID)/resolve/main/\(path)")
     }
 
+    func hfResolveURLs(path: String) -> [URL] {
+        allDownloadRepoIDs.compactMap { repo in
+            URL(string: "https://huggingface.co/\(repo)/resolve/main/\(path)")
+        }
+    }
+
     func hfTreeURL(path: String, recursive: Bool = true) -> URL? {
         let encoded = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
         let base = "https://huggingface.co/api/models/\(repoID)/tree/main/\(encoded)"
@@ -101,6 +114,17 @@ nonisolated struct ModelSource: Sendable, Identifiable {
             return URL(string: base + "?recursive=true")
         }
         return URL(string: base)
+    }
+
+    func hfTreeURLs(path: String, recursive: Bool = true) -> [URL] {
+        let encoded = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
+        return allDownloadRepoIDs.compactMap { repo in
+            let base = "https://huggingface.co/api/models/\(repo)/tree/main/\(encoded)"
+            if recursive {
+                return URL(string: base + "?recursive=true")
+            }
+            return URL(string: base)
+        }
     }
 
     func tokenizerFileURL(fileName: String, fromRepo repo: String? = nil) -> URL? {
@@ -120,6 +144,7 @@ struct ModelSourceCatalog: Sendable {
             artifactType: .compiledModel,
             tokenizerFiles: ["tokenizer.json", "tokenizer_config.json"],
             configFiles: [],
+            downloadFallbackRepoIDs: [],
             tokenizerRepoID: nil,
             tokenizerFallbackRepoIDs: [],
             requiresAuth: false,
@@ -140,6 +165,7 @@ struct ModelSourceCatalog: Sendable {
             artifactType: .compiledModel,
             tokenizerFiles: ["tokenizer.json", "tokenizer_config.json"],
             configFiles: [],
+            downloadFallbackRepoIDs: [],
             tokenizerRepoID: "Qwen/Qwen3-4B",
             tokenizerFallbackRepoIDs: [],
             requiresAuth: false,
@@ -160,6 +186,7 @@ struct ModelSourceCatalog: Sendable {
             artifactType: .compiledModel,
             tokenizerFiles: ["tokenizer.json", "tokenizer_config.json"],
             configFiles: [],
+            downloadFallbackRepoIDs: [],
             tokenizerRepoID: nil,
             tokenizerFallbackRepoIDs: [],
             requiresAuth: false,
@@ -180,6 +207,7 @@ struct ModelSourceCatalog: Sendable {
             artifactType: .zipArchive,
             tokenizerFiles: ["tokenizer.json", "tokenizer_config.json"],
             configFiles: [],
+            downloadFallbackRepoIDs: [],
             tokenizerRepoID: "finnvoorhees/coreml-Llama-3.2-3B-Instruct-4bit",
             tokenizerFallbackRepoIDs: ["yacht/Llama-3.2-1B-Instruct-CoreML"],
             requiresAuth: false,
@@ -200,6 +228,7 @@ struct ModelSourceCatalog: Sendable {
             artifactType: .mlpackageDirectory,
             tokenizerFiles: ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"],
             configFiles: ["config.json", "generation_config.json"],
+            downloadFallbackRepoIDs: [],
             tokenizerRepoID: nil,
             tokenizerFallbackRepoIDs: [
                 "dphn/Dolphin3.0-Llama3.2-3B",
@@ -226,6 +255,7 @@ struct ModelSourceCatalog: Sendable {
             artifactType: .compiledModel,
             tokenizerFiles: ["tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"],
             configFiles: [],
+            downloadFallbackRepoIDs: [],
             tokenizerRepoID: nil,
             tokenizerFallbackRepoIDs: [],
             requiresAuth: false,
@@ -246,6 +276,7 @@ struct ModelSourceCatalog: Sendable {
             artifactType: .compiledModel,
             tokenizerFiles: ["tokenizer.json", "tokenizer_config.json"],
             configFiles: [],
+            downloadFallbackRepoIDs: [],
             tokenizerRepoID: "Qwen/Qwen3-Embedding-0.6B",
             tokenizerFallbackRepoIDs: [],
             requiresAuth: false,
@@ -423,4 +454,104 @@ nonisolated struct TokenizerFallbackResult: Sendable {
     let filesDownloaded: [String]
     let filesMissing: [String]
     let gatedRepos: [String]
+}
+
+nonisolated enum DownloadFailureKind: Sendable, Equatable {
+    case cancelled
+    case transientNetwork
+    case httpStatus(Int)
+    case other
+}
+
+nonisolated enum DownloadRecoveryAction: Sendable, Equatable {
+    case retry(delaySeconds: Double)
+    case switchToFallbackURL
+    case fail
+}
+
+nonisolated struct DownloadRetryPlanner: Sendable {
+    let maxRetriesPerURL: Int
+    let baseDelaySeconds: Double
+    let maxDelaySeconds: Double
+
+    init(maxRetriesPerURL: Int = 3, baseDelaySeconds: Double = 1, maxDelaySeconds: Double = 8) {
+        self.maxRetriesPerURL = maxRetriesPerURL
+        self.baseDelaySeconds = baseDelaySeconds
+        self.maxDelaySeconds = maxDelaySeconds
+    }
+
+    func nextAction(for failure: DownloadFailureKind, retryCountOnCurrentURL: Int, hasFallbackURL: Bool) -> DownloadRecoveryAction {
+        switch failure {
+        case .cancelled:
+            return .fail
+        case .transientNetwork:
+            if retryCountOnCurrentURL < maxRetriesPerURL {
+                return .retry(delaySeconds: delay(forRetryAttempt: retryCountOnCurrentURL + 1))
+            }
+            return hasFallbackURL ? .switchToFallbackURL : .fail
+        case .httpStatus(let status):
+            if status == 401 || status == 403 || status == 404 {
+                return hasFallbackURL ? .switchToFallbackURL : .fail
+            }
+            if status == 408 || status == 416 || status == 429 || (500...599).contains(status) {
+                if retryCountOnCurrentURL < maxRetriesPerURL {
+                    return .retry(delaySeconds: delay(forRetryAttempt: retryCountOnCurrentURL + 1))
+                }
+                return hasFallbackURL ? .switchToFallbackURL : .fail
+            }
+            return .fail
+        case .other:
+            return .fail
+        }
+    }
+
+    func delay(forRetryAttempt attempt: Int) -> Double {
+        let normalizedAttempt = max(1, attempt)
+        let delay = baseDelaySeconds * pow(2, Double(normalizedAttempt - 1))
+        return min(delay, maxDelaySeconds)
+    }
+}
+
+nonisolated struct DownloadURLSelector: Sendable {
+    static func nextIndex(after action: DownloadRecoveryAction, currentIndex: Int, totalURLCount: Int) -> Int? {
+        switch action {
+        case .retry:
+            return currentIndex
+        case .switchToFallbackURL:
+            let next = currentIndex + 1
+            return next < totalURLCount ? next : nil
+        case .fail:
+            return nil
+        }
+    }
+}
+
+nonisolated enum ModelDownloadEvent: Sendable, Equatable {
+    case started
+    case progress(Double)
+    case beginInstall
+    case success(hasTokenizer: Bool)
+    case fail(message: String)
+    case cancelled
+}
+
+nonisolated struct ModelDownloadStateReducer: Sendable {
+    static func reduce(_ state: ModelDownloadState, event: ModelDownloadEvent) -> ModelDownloadState {
+        _ = state
+        switch event {
+        case .started:
+            return .downloading(progress: 0)
+        case .progress(let value):
+            let clamped = max(0, min(1, value))
+            return .downloading(progress: clamped)
+        case .beginInstall:
+            return .installing
+        case .success(let hasTokenizer):
+            return hasTokenizer ? .installed : .installedMissingTokenizer
+        case .fail(let message):
+            return .error(message)
+        case .cancelled:
+            return .notDownloaded
+        }
+    }
 }
