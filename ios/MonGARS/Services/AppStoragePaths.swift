@@ -104,7 +104,10 @@ enum AppStoragePaths {
         let fileManager = FileManager.default
         let logger = Logger(subsystem: "com.mongars.storage", category: "paths")
         var legacyIsDir: ObjCBool = false
+        // Always run per-source migration once, regardless of whether the old
+        // monolithic `Documents/models` directory exists in this install.
         guard fileManager.fileExists(atPath: legacyModelsDirectory.path, isDirectory: &legacyIsDir), legacyIsDir.boolValue else {
+            try migratePerSourceLegacyModelDirectoriesIfNeeded()
             return
         }
 
@@ -133,6 +136,77 @@ enum AppStoragePaths {
         if remainingItems.isEmpty {
             try? fileManager.removeItem(at: legacyModelsDirectory)
         }
+
+        try migratePerSourceLegacyModelDirectoriesIfNeeded()
+    }
+
+    /// Migrates legacy layouts where model folders were stored directly under Documents
+    /// (e.g. `<Documents>/<source-id>` or `<Documents>/models/<source-id>` in older builds).
+    private static func migratePerSourceLegacyModelDirectoriesIfNeeded() throws {
+        let fileManager = FileManager.default
+        let logger = Logger(subsystem: "com.mongars.storage", category: "paths")
+        var didEnsureModelsDirectory = false
+
+        for source in ModelSourceCatalog.allSources {
+            let destination = modelsDirectory.appendingPathComponent(source.id, isDirectory: true)
+            for sourceURL in legacyModelDirectoryCandidates(for: source.id) {
+                var sourceIsDir: ObjCBool = false
+                guard fileManager.fileExists(atPath: sourceURL.path, isDirectory: &sourceIsDir), sourceIsDir.boolValue else {
+                    continue
+                }
+                if sourceURL.standardizedFileURL == destination.standardizedFileURL {
+                    continue
+                }
+
+                var destinationIsDir: ObjCBool = false
+                let destinationExists = fileManager.fileExists(atPath: destination.path, isDirectory: &destinationIsDir)
+                if destinationExists && !destinationIsDir.boolValue {
+                    logger.error("Model destination exists as file: \(destination.path, privacy: .public)")
+                    throw StoragePathError.pathExistsAsFile(destination)
+                }
+
+                if !didEnsureModelsDirectory {
+                    try fileManager.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
+                    didEnsureModelsDirectory = true
+                }
+
+                if !destinationExists {
+                    try fileManager.moveItem(at: sourceURL, to: destination)
+                    logger.info("Migrated per-source model directory from \(sourceURL.path, privacy: .public) to \(destination.path, privacy: .public)")
+                    continue
+                }
+
+                let sourceItems = try fileManager.contentsOfDirectory(at: sourceURL, includingPropertiesForKeys: nil)
+                for item in sourceItems {
+                    let mergedDestination = destination.appendingPathComponent(item.lastPathComponent)
+                    if fileManager.fileExists(atPath: mergedDestination.path) {
+                        continue
+                    }
+                    try fileManager.moveItem(at: item, to: mergedDestination)
+                }
+
+                let remainingItems = (try? fileManager.contentsOfDirectory(at: sourceURL, includingPropertiesForKeys: nil)) ?? []
+                if remainingItems.isEmpty {
+                    try? fileManager.removeItem(at: sourceURL)
+                }
+                logger.info("Merged per-source legacy model directory from \(sourceURL.path, privacy: .public) into \(destination.path, privacy: .public)")
+            }
+        }
+    }
+
+    private static func legacyModelDirectoryCandidates(for sourceID: ModelSourceID) -> [URL] {
+        let docs = URL.documentsDirectory
+        return [
+            docs.appendingPathComponent(sourceID, isDirectory: true),
+            docs.appendingPathComponent("models", isDirectory: true)
+                .appendingPathComponent(sourceID, isDirectory: true),
+            docs.appendingPathComponent(appFolderName, isDirectory: true)
+                .appendingPathComponent("models", isDirectory: true)
+                .appendingPathComponent(sourceID, isDirectory: true),
+            docs.appendingPathComponent("ANEMLL Chat", isDirectory: true)
+                .appendingPathComponent("models", isDirectory: true)
+                .appendingPathComponent(sourceID, isDirectory: true),
+        ]
     }
 
     private static func migrateLegacyEmbeddingsIfNeeded() throws {
