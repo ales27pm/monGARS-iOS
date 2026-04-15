@@ -8,6 +8,21 @@ import UserNotifications
 @Observable
 @MainActor
 final class PermissionsManager {
+    struct NativePermissionStatus: Identifiable, Sendable {
+        let feature: NativeFeature
+        let granted: Bool
+
+        var id: NativeFeature { feature }
+    }
+
+    enum NativeFeature: CaseIterable, Sendable {
+        case location
+        case contacts
+        case calendar
+        case reminders
+        case notifications
+    }
+
     var microphoneGranted: Bool = false
     var speechRecognitionGranted: Bool = false
     var contactsGranted: Bool = false
@@ -86,7 +101,6 @@ final class PermissionsManager {
         await requestContactsAccess()
         await requestCalendarAccess()
         await requestRemindersAccess()
-        await requestAllVoicePermissions()
         checkCurrentStatus()
     }
 
@@ -97,6 +111,16 @@ final class PermissionsManager {
 
     var canUseVoice: Bool {
         microphoneGranted && speechRecognitionGranted
+    }
+
+    var nativePermissionStatuses: [NativePermissionStatus] {
+        NativeFeature.allCases.map { feature in
+            NativePermissionStatus(feature: feature, granted: isNativePermissionGranted(feature))
+        }
+    }
+
+    var allNativeFeaturePermissionsGranted: Bool {
+        NativeFeature.allCases.allSatisfy(isNativePermissionGranted(_:))
     }
 
     func refreshAll() {
@@ -116,6 +140,36 @@ final class PermissionsManager {
         Task {
             let settings = await UNUserNotificationCenter.current().notificationSettings()
             notificationsGranted = settings.authorizationStatus == .authorized
+        }
+    }
+
+    func nativeFeatureTitle(_ feature: NativeFeature, localeManager: LocaleManager) -> String {
+        switch feature {
+        case .location:
+            return localeManager.localizedString("Location", "Localisation")
+        case .contacts:
+            return localeManager.localizedString("Contacts", "Contacts")
+        case .calendar:
+            return localeManager.localizedString("Calendar", "Calendrier")
+        case .reminders:
+            return localeManager.localizedString("Reminders", "Rappels")
+        case .notifications:
+            return localeManager.localizedString("Notifications", "Notifications")
+        }
+    }
+
+    private func isNativePermissionGranted(_ feature: NativeFeature) -> Bool {
+        switch feature {
+        case .location:
+            return locationAuthorized
+        case .contacts:
+            return contactsGranted
+        case .calendar:
+            return calendarGranted
+        case .reminders:
+            return remindersGranted
+        case .notifications:
+            return notificationsGranted
         }
     }
 }

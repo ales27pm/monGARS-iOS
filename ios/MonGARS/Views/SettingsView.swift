@@ -320,28 +320,14 @@ struct SettingsView: View {
 
     private var nativePermissionsSection: some View {
         Section {
-            permissionStatusRow(
-                title: viewModel.localeManager.localizedString("Location", "Localisation"),
-                granted: viewModel.permissionsManager.locationAuthorized
-            )
-            permissionStatusRow(
-                title: viewModel.localeManager.localizedString("Contacts", "Contacts"),
-                granted: viewModel.permissionsManager.contactsGranted
-            )
-            permissionStatusRow(
-                title: viewModel.localeManager.localizedString("Calendar", "Calendrier"),
-                granted: viewModel.permissionsManager.calendarGranted
-            )
-            permissionStatusRow(
-                title: viewModel.localeManager.localizedString("Reminders", "Rappels"),
-                granted: viewModel.permissionsManager.remindersGranted
-            )
-            permissionStatusRow(
-                title: viewModel.localeManager.localizedString("Notifications", "Notifications"),
-                granted: viewModel.permissionsManager.notificationsGranted
-            )
+            ForEach(viewModel.permissionsManager.nativePermissionStatuses) { status in
+                permissionStatusRow(
+                    title: viewModel.permissionsManager.nativeFeatureTitle(status.feature, localeManager: viewModel.localeManager),
+                    granted: status.granted
+                )
+            }
 
-            if !allNativePermissionsGranted {
+            if !viewModel.permissionsManager.allNativeFeaturePermissionsGranted {
                 Button {
                     Task { await viewModel.requestAllNativeFeaturePermissions() }
                 } label: {
@@ -355,8 +341,8 @@ struct SettingsView: View {
             Text(viewModel.localeManager.localizedString("Native Features", "Fonctionnalités natives"))
         } footer: {
             Text(viewModel.localeManager.localizedString(
-                "Grant access to all built-in tools used by MonGARS (location, contacts, calendar, reminders, notifications, and voice).",
-                "Accorde l'accès à tous les outils natifs utilisés par MonGARS (localisation, contacts, calendrier, rappels, notifications et voix)."
+                "Grant access to all built-in tools used by MonGARS (location, contacts, calendar, reminders, and notifications).",
+                "Accorde l'accès à tous les outils natifs utilisés par MonGARS (localisation, contacts, calendrier, rappels et notifications)."
             ))
         }
     }
@@ -462,15 +448,6 @@ struct SettingsView: View {
             Image(systemName: "exclamationmark.triangle")
                 .foregroundStyle(.red)
         }
-    }
-
-    private var allNativePermissionsGranted: Bool {
-        viewModel.permissionsManager.locationAuthorized &&
-        viewModel.permissionsManager.contactsGranted &&
-        viewModel.permissionsManager.calendarGranted &&
-        viewModel.permissionsManager.remindersGranted &&
-        viewModel.permissionsManager.notificationsGranted &&
-        viewModel.permissionsManager.canUseVoice
     }
 
     private func permissionStatusRow(title: String, granted: Bool) -> some View {

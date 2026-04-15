@@ -1,8 +1,10 @@
 import SwiftData
 import SwiftUI
+import os
 
 @main
 struct MonGARSApp: App {
+    private let logger = Logger(subsystem: "com.mongars.app", category: "startup")
     @State private var localeManager = LocaleManager()
     @State private var modelDownloadManager: ModelDownloadManager
     @State private var permissionsManager = PermissionsManager()
@@ -12,7 +14,11 @@ struct MonGARSApp: App {
     @State private var toolsRegistered = false
 
     init() {
-        AppStoragePaths.preparePersistentDirectories()
+        do {
+            try AppStoragePaths.preparePersistentDirectories()
+        } catch {
+            logger.error("Failed to prepare app storage folders: \(error.localizedDescription, privacy: .public)")
+        }
         var manager = ModelDownloadManager()
         if let storedID = SecureStoreService.syncLoad(key: .selectedModelVariant) {
             if ModelSourceCatalog.chatSource(for: storedID) != nil {

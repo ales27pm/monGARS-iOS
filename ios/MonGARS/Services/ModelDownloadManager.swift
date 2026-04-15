@@ -23,7 +23,14 @@ final class ModelDownloadManager {
     private let fileManager = FileManager.default
 
     init() {
-        AppStoragePaths.preparePersistentDirectories()
+        do {
+            try AppStoragePaths.preparePersistentDirectories()
+        } catch {
+            llmState = .error("Storage initialization failed: \(error.localizedDescription)")
+            embeddingState = .error("Storage initialization failed: \(error.localizedDescription)")
+            lastDiagnosticMessage = "Storage initialization failed: \(error.localizedDescription)"
+            logger.error("Failed to prepare persistent directories: \(error.localizedDescription, privacy: .public)")
+        }
         checkExistingModels()
     }
 
