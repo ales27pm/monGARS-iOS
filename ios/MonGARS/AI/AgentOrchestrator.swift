@@ -1,8 +1,10 @@
 import Foundation
+import os
 
 @Observable
 @MainActor
 final class AgentOrchestrator {
+    private let logger = Logger(subsystem: "com.mongars.ai", category: "agent")
     let llmEngine: LLMEngine
     let toolRegistry: ToolRegistry
     let localeManager: LocaleManager
@@ -76,7 +78,7 @@ final class AgentOrchestrator {
                         continuation.yield(token)
                     }
 
-                    if let toolCall = parseToolCall(from: fullResponse) {
+                    if let toolCall = try parseToolCall(from: fullResponse) {
                         pendingToolCall = toolCall
                     }
 
@@ -93,6 +95,9 @@ final class AgentOrchestrator {
                     }
 
                     continuation.finish()
+                } catch let parseError as ToolCallParsingError {
+                    logger.warning("Invalid tool-call output. \(parseError.logMessage, privacy: .public)")
+                    continuation.finish(throwing: AgentError.toolCallValidationFailed(parseError.localizedDescription))
                 } catch {
                     continuation.finish(throwing: error)
                 }
@@ -241,34 +246,363 @@ final class AgentOrchestrator {
 
     // MARK: - Tool Parsing
 
-    private func parseToolCall(from response: String) -> ToolCallRequest? {
-        guard response.contains("<tool_call>") else { return nil }
-
-        guard let startRange = response.range(of: "<tool_call>"),
-              let endRange = response.range(of: "</tool_call>") else {
+    private func parseToolCall(from response: String) throws -> ToolCallRequest? {
+        guard let parsedCall = try ToolCallParser.parseToolCall(from: response, schemas: toolRegistry.registeredSchemas) else {
             return nil
         }
 
-        let jsonString = String(response[startRange.upperBound..<endRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard let data = jsonString.data(using: .utf8),
-              let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let name = parsed["name"] as? String else {
-            return nil
-        }
-
-        let args = (parsed["arguments"] as? [String: String]) ?? [:]
-        let schemaRequiresApproval = toolRegistry.requiresApproval(toolName: name)
-        let isNetwork = toolRegistry.isNetworkRequired(toolName: name)
+        let schemaRequiresApproval = toolRegistry.requiresApproval(toolName: parsedCall.toolName)
+        let isNetwork = toolRegistry.isNetworkRequired(toolName: parsedCall.toolName)
         let forceApproval = isNetwork && networkPolicy.askBeforeNetworkUse
         let requiresApproval = schemaRequiresApproval || forceApproval
 
-        return ToolCallRequest(toolName: name, arguments: args, requiresApproval: requiresApproval)
+        return ToolCallRequest(toolName: parsedCall.toolName, arguments: parsedCall.arguments, requiresApproval: requiresApproval)
     }
 }
 
 nonisolated enum AgentError: Error, Sendable {
     case modelNotReady
     case toolExecutionFailed(String)
+    case toolCallValidationFailed(String)
     case promptTooLong
+}
+
+extension AgentError: LocalizedError {
+    nonisolated var errorDescription: String? {
+        switch self {
+        case .modelNotReady:
+            "Model is not ready."
+        case .toolExecutionFailed(let message):
+            message
+        case .toolCallValidationFailed(let message):
+            message
+        case .promptTooLong:
+            "Prompt exceeded model context limits."
+        }
+    }
+}
+
+nonisolated struct ParsedToolCall: Equatable, Sendable {
+    let toolName: String
+    let arguments: [String: String]
+}
+
+nonisolated enum ToolCallParsingError: Error, Sendable, Equatable {
+    case unbalancedEnvelope
+    case malformedJSON
+    case missingToolName
+    case unknownTool(String)
+    case argumentsMustBeObject
+    case missingRequiredArguments([String])
+    case invalidArgumentType(argument: String, expected: ToolParameterType)
+    case nonScalarUnknownArgument(String)
+
+    nonisolated var logMessage: String {
+        switch self {
+        case .unbalancedEnvelope:
+            "Tool-call tags are unbalanced."
+        case .malformedJSON:
+            "Tool-call payload is not valid JSON."
+        case .missingToolName:
+            "Tool-call payload is missing a valid tool name."
+        case .unknownTool(let name):
+            "Unknown tool '\(name)'."
+        case .argumentsMustBeObject:
+            "Tool-call arguments must be a JSON object."
+        case .missingRequiredArguments(let names):
+            "Missing required tool arguments: \(names.joined(separator: ", "))."
+        case .invalidArgumentType(let argument, let expected):
+            "Argument '\(argument)' does not match expected type '\(expected.rawValue)'."
+        case .nonScalarUnknownArgument(let name):
+            "Unknown argument '\(name)' must be a scalar value."
+        }
+    }
+}
+
+extension ToolCallParsingError: LocalizedError {
+    nonisolated var errorDescription: String? {
+        switch self {
+        case .unknownTool(let name):
+            "Tool call validation failed: unknown tool '\(name)'."
+        case .missingRequiredArguments(let names):
+            "Tool call validation failed: missing required argument(s): \(names.joined(separator: ", "))."
+        default:
+            "Tool call validation failed: \(logMessage)"
+        }
+    }
+}
+
+nonisolated enum ToolJSONValue: Sendable, Equatable {
+    case string(String)
+    case integer(Int)
+    case double(Double)
+    case boolean(Bool)
+    case object([String: ToolJSONValue])
+    case array([ToolJSONValue])
+    case null
+
+    nonisolated var scalarString: String? {
+        switch self {
+        case .string(let value):
+            value
+        case .integer(let value):
+            String(value)
+        case .double(let value):
+            String(value)
+        case .boolean(let value):
+            value ? "true" : "false"
+        case .object, .array, .null:
+            nil
+        }
+    }
+
+    nonisolated var isNull: Bool {
+        if case .null = self {
+            true
+        } else {
+            false
+        }
+    }
+}
+
+nonisolated enum ToolCallParser {
+    private static let toolCallOpenTag = "<tool_call>"
+    private static let toolCallCloseTag = "</tool_call>"
+
+    static func parseToolCall(from response: String, schemas: [ToolSchema]) throws -> ParsedToolCall? {
+        guard let payload = try extractFinalToolCallPayload(from: response) else {
+            return nil
+        }
+
+        guard let data = payload.data(using: .utf8) else {
+            throw ToolCallParsingError.malformedJSON
+        }
+
+        let rootObject: Any
+        do {
+            rootObject = try JSONSerialization.jsonObject(with: data, options: [])
+        } catch {
+            throw ToolCallParsingError.malformedJSON
+        }
+
+        guard let root = rootObject as? [String: Any] else {
+            throw ToolCallParsingError.malformedJSON
+        }
+
+        guard let rawToolName = root["name"] as? String else {
+            throw ToolCallParsingError.missingToolName
+        }
+
+        let toolName = rawToolName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !toolName.isEmpty else {
+            throw ToolCallParsingError.missingToolName
+        }
+
+        guard let schema = schemas.first(where: { $0.name == toolName }) else {
+            throw ToolCallParsingError.unknownTool(toolName)
+        }
+
+        let rawArguments = try parseArguments(root["arguments"])
+        let normalizedArguments = try normalizeArguments(rawArguments, schema: schema)
+
+        return ParsedToolCall(toolName: toolName, arguments: normalizedArguments)
+    }
+
+    static func extractFinalToolCallPayload(from response: String) throws -> String? {
+        var cursor = response.startIndex
+        var openTagEnds: [String.Index] = []
+        var sawAnyToolTag = false
+        var finalPayloadRange: Range<String.Index>?
+
+        while cursor < response.endIndex {
+            let nextOpen = response.range(of: toolCallOpenTag, range: cursor..<response.endIndex)
+            let nextClose = response.range(of: toolCallCloseTag, range: cursor..<response.endIndex)
+
+            if let open = nextOpen, (nextClose == nil || open.lowerBound < nextClose!.lowerBound) {
+                sawAnyToolTag = true
+                openTagEnds.append(open.upperBound)
+                cursor = open.upperBound
+                continue
+            }
+
+            if let close = nextClose {
+                sawAnyToolTag = true
+                guard let payloadStart = openTagEnds.popLast() else {
+                    throw ToolCallParsingError.unbalancedEnvelope
+                }
+                finalPayloadRange = payloadStart..<close.lowerBound
+                cursor = close.upperBound
+                continue
+            }
+
+            break
+        }
+
+        if !openTagEnds.isEmpty {
+            throw ToolCallParsingError.unbalancedEnvelope
+        }
+
+        guard sawAnyToolTag else {
+            return nil
+        }
+
+        guard let finalPayloadRange else {
+            throw ToolCallParsingError.unbalancedEnvelope
+        }
+
+        return String(response[finalPayloadRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func parseArguments(_ rawArguments: Any?) throws -> [String: ToolJSONValue] {
+        guard let rawArguments else {
+            return [:]
+        }
+
+        if rawArguments is NSNull {
+            return [:]
+        }
+
+        guard let argumentObject = rawArguments as? [String: Any] else {
+            throw ToolCallParsingError.argumentsMustBeObject
+        }
+
+        var parsed: [String: ToolJSONValue] = [:]
+        parsed.reserveCapacity(argumentObject.count)
+
+        for (name, rawValue) in argumentObject {
+            parsed[name] = try parseJSONValue(rawValue)
+        }
+
+        return parsed
+    }
+
+    private static func parseJSONValue(_ rawValue: Any) throws -> ToolJSONValue {
+        if rawValue is NSNull {
+            return .null
+        }
+
+        if let stringValue = rawValue as? String {
+            return .string(stringValue)
+        }
+
+        if let numberValue = rawValue as? NSNumber {
+            if CFGetTypeID(numberValue) == CFBooleanGetTypeID() {
+                return .boolean(numberValue.boolValue)
+            }
+
+            let asDouble = numberValue.doubleValue
+            if asDouble.isFinite,
+               asDouble.rounded(.towardZero) == asDouble,
+               asDouble >= Double(Int.min),
+               asDouble <= Double(Int.max) {
+                return .integer(Int(asDouble))
+            }
+            return .double(asDouble)
+        }
+
+        if let objectValue = rawValue as? [String: Any] {
+            var object: [String: ToolJSONValue] = [:]
+            object.reserveCapacity(objectValue.count)
+            for (key, value) in objectValue {
+                object[key] = try parseJSONValue(value)
+            }
+            return .object(object)
+        }
+
+        if let arrayValue = rawValue as? [Any] {
+            return .array(try arrayValue.map(parseJSONValue))
+        }
+
+        throw ToolCallParsingError.malformedJSON
+    }
+
+    private static func normalizeArguments(_ rawArguments: [String: ToolJSONValue], schema: ToolSchema) throws -> [String: String] {
+        let parameterByName = Dictionary(uniqueKeysWithValues: schema.parameters.map { ($0.name, $0) })
+        var normalizedArguments: [String: String] = [:]
+        normalizedArguments.reserveCapacity(rawArguments.count)
+
+        for (argumentName, rawValue) in rawArguments {
+            if rawValue.isNull {
+                continue
+            }
+
+            if let parameter = parameterByName[argumentName] {
+                guard let coercedValue = coerceArgument(rawValue, parameterType: parameter.type) else {
+                    throw ToolCallParsingError.invalidArgumentType(argument: argumentName, expected: parameter.type)
+                }
+                normalizedArguments[argumentName] = coercedValue
+                continue
+            }
+
+            guard let scalarValue = rawValue.scalarString else {
+                throw ToolCallParsingError.nonScalarUnknownArgument(argumentName)
+            }
+            normalizedArguments[argumentName] = scalarValue
+        }
+
+        let missingRequired = schema.parameters
+            .filter(\.required)
+            .map(\.name)
+            .filter { name in
+                guard let value = normalizedArguments[name] else { return true }
+                return value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            .sorted()
+
+        if !missingRequired.isEmpty {
+            throw ToolCallParsingError.missingRequiredArguments(missingRequired)
+        }
+
+        return normalizedArguments
+    }
+
+    private static func coerceArgument(_ value: ToolJSONValue, parameterType: ToolParameterType) -> String? {
+        switch parameterType {
+        case .string:
+            return value.scalarString
+        case .integer:
+            switch value {
+            case .integer(let intValue):
+                return String(intValue)
+            case .double(let doubleValue):
+                guard doubleValue.isFinite,
+                      doubleValue.rounded(.towardZero) == doubleValue,
+                      doubleValue >= Double(Int.min),
+                      doubleValue <= Double(Int.max) else {
+                    return nil
+                }
+                return String(Int(doubleValue))
+            case .string(let stringValue):
+                let trimmed = stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let intValue = Int(trimmed) else { return nil }
+                return String(intValue)
+            default:
+                return nil
+            }
+        case .boolean:
+            switch value {
+            case .boolean(let boolValue):
+                return boolValue ? "true" : "false"
+            case .integer(let intValue):
+                if intValue == 0 { return "false" }
+                if intValue == 1 { return "true" }
+                return nil
+            case .string(let stringValue):
+                let lowered = stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if lowered == "true" || lowered == "1" || lowered == "yes" {
+                    return "true"
+                }
+                if lowered == "false" || lowered == "0" || lowered == "no" {
+                    return "false"
+                }
+                return nil
+            default:
+                return nil
+            }
+        case .date:
+            guard case .string(let stringValue) = value else { return nil }
+            let trimmed = stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+    }
 }

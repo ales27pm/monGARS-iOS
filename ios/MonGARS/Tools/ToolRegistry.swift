@@ -24,6 +24,10 @@ final class ToolRegistry {
         tools[toolName]?.schema.requiresNetwork ?? false
     }
 
+    func schema(for toolName: String) -> ToolSchema? {
+        tools[toolName]?.schema
+    }
+
     func availableToolDescriptions(policy: NetworkPolicyService?) -> String {
         let filtered = tools.values.filter { tool in
             if tool.schema.requiresNetwork {

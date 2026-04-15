@@ -103,6 +103,66 @@ struct MonGARSTests {
         #expect(plan.requiresStateReset)
     }
 
+    @Test func toolCallParserExtractsValidToolCall() throws {
+        let response = #"<tool_call>{"name":"create_reminder","arguments":{"title":"Buy milk"}}</tool_call>"#
+        let parsed = try ToolCallParser.parseToolCall(from: response, schemas: parserTestSchemas())
+
+        #expect(parsed?.toolName == "create_reminder")
+        #expect(parsed?.arguments["title"] == "Buy milk")
+    }
+
+    @Test func toolCallParserUsesFinalBalancedEnvelopeWhenTextHasMultipleBlocks() throws {
+        let response = """
+        I will try one.
+        <tool_call>{"name":"create_reminder","arguments":{"title":"First"}}</tool_call>
+        Ignore that and use the latest:
+        <tool_call>{"name":"web_search","arguments":{"query":"Montreal weather","language":"en"}}</tool_call>
+        """
+
+        let parsed = try ToolCallParser.parseToolCall(from: response, schemas: parserTestSchemas())
+        #expect(parsed?.toolName == "web_search")
+        #expect(parsed?.arguments["query"] == "Montreal weather")
+    }
+
+    @Test func toolCallParserRejectsMalformedJSON() {
+        let response = #"<tool_call>{"name":"create_reminder","arguments":{"title":"Buy milk"}</tool_call>"#
+
+        do {
+            _ = try ToolCallParser.parseToolCall(from: response, schemas: parserTestSchemas())
+            Issue.record("Expected malformed JSON to throw, but parse succeeded.")
+        } catch let error as ToolCallParsingError {
+            #expect(error == .malformedJSON)
+        } catch {
+            Issue.record("Unexpected error type: \(error)")
+        }
+    }
+
+    @Test func toolCallParserRejectsMissingRequiredArguments() {
+        let response = #"<tool_call>{"name":"create_reminder","arguments":{}}</tool_call>"#
+
+        do {
+            _ = try ToolCallParser.parseToolCall(from: response, schemas: parserTestSchemas())
+            Issue.record("Expected missing required args error, but parse succeeded.")
+        } catch let error as ToolCallParsingError {
+            #expect(error == .missingRequiredArguments(["title"]))
+        } catch {
+            Issue.record("Unexpected error type: \(error)")
+        }
+    }
+
+    @Test func toolCallParserRejectsUnknownToolName() {
+        let response = #"<tool_call>{"name":"nonexistent_tool","arguments":{"title":"Buy milk"}}</tool_call>"#
+
+        do {
+            _ = try ToolCallParser.parseToolCall(from: response, schemas: parserTestSchemas())
+            Issue.record("Expected unknown tool error, but parse succeeded.")
+        } catch let error as ToolCallParsingError {
+            #expect(error == .unknownTool("nonexistent_tool"))
+        } catch {
+            Issue.record("Unexpected error type: \(error)")
+        }
+    }
+
     @Test func embeddingStoreSearchUsesBoundedRecentCandidateWindow() async throws {
         let topK = 1
         let candidateLimit = EmbeddingStore.searchCandidateLimit(topK: topK)
@@ -403,5 +463,28 @@ struct MonGARSTests {
             computeTimeSeconds: 0.01,
             inputTokenCount: Int(marker)
         )
+    }
+
+    private func parserTestSchemas() -> [ToolSchema] {
+        [
+            ToolSchema(
+                name: "create_reminder",
+                description: "Creates a reminder",
+                parameters: [
+                    ToolParameter(name: "title", description: "Reminder title", type: .string, required: true),
+                    ToolParameter(name: "notes", description: "Reminder notes", type: .string, required: false),
+                ],
+                requiresApproval: true
+            ),
+            ToolSchema(
+                name: "web_search",
+                description: "Searches the web",
+                parameters: [
+                    ToolParameter(name: "query", description: "Search query", type: .string, required: true),
+                    ToolParameter(name: "language", description: "Language code", type: .string, required: false),
+                ],
+                requiresApproval: true
+            )
+        ]
     }
 }
