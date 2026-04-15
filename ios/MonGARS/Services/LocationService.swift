@@ -54,7 +54,7 @@ final class LocationService: NSObject {
     }
 }
 
-extension LocationService: @preconcurrency CLLocationManagerDelegate {
+extension LocationService: CLLocationManagerDelegate {
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         Task { @MainActor in
             guard let location = locations.last else { return }

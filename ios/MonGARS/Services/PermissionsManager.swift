@@ -7,7 +7,7 @@ import UserNotifications
 
 @Observable
 @MainActor
-final class PermissionsManager {
+final class PermissionsManager: NSObject {
     struct NativePermissionStatus: Identifiable, Sendable {
         let feature: NativeFeature
         let granted: Bool
@@ -33,7 +33,8 @@ final class PermissionsManager {
     private let locationManager = CLLocationManager()
     private var locationPermissionContinuation: CheckedContinuation<Bool, Never>?
 
-    init() {
+    override init() {
+        super.init()
         locationManager.delegate = self
         checkCurrentStatus()
     }
@@ -189,7 +190,7 @@ final class PermissionsManager {
     }
 }
 
-extension PermissionsManager: @preconcurrency CLLocationManagerDelegate {
+extension PermissionsManager: CLLocationManagerDelegate {
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         Task { @MainActor [weak self] in
             guard let self else { return }

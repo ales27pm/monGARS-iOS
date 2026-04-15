@@ -19,7 +19,7 @@ struct MonGARSApp: App {
         } catch {
             logger.error("Failed to prepare app storage folders: \(error.localizedDescription, privacy: .public)")
         }
-        var manager = ModelDownloadManager()
+        let manager = ModelDownloadManager()
         if let storedID = SecureStoreService.syncLoad(key: .selectedModelVariant) {
             if ModelSourceCatalog.chatSource(for: storedID) != nil {
                 manager.selectedChatSourceID = storedID

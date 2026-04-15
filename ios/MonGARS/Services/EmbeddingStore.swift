@@ -3,7 +3,7 @@ import Foundation
 import SQLite3
 import os
 
-private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+nonisolated(unsafe) private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
 actor EmbeddingStore {
     private var db: OpaquePointer?
@@ -80,7 +80,7 @@ actor EmbeddingStore {
         sqlite3_bind_double(stmt, 5, chunk.createdAt.timeIntervalSince1970)
 
         let vectorData = chunk.vector.withUnsafeBufferPointer { Data(buffer: $0) }
-        vectorData.withUnsafeBytes { raw in
+        _ = vectorData.withUnsafeBytes { raw in
             sqlite3_bind_blob(stmt, 6, raw.baseAddress, Int32(raw.count), SQLITE_TRANSIENT)
         }
         sqlite3_bind_int(stmt, 7, Int32(chunk.dimensions))

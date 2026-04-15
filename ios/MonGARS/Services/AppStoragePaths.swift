@@ -19,7 +19,7 @@ enum AppStoragePaths {
         appRootDirectory.appending(path: "data", directoryHint: .isDirectory)
     }
 
-    static var embeddingsDatabaseURL: URL {
+    nonisolated(unsafe) static var embeddingsDatabaseURL: URL {
         applicationSupportDirectory.appending(path: appFolderName, directoryHint: .isDirectory)
             .appending(path: "embeddings.sqlite3", directoryHint: .notDirectory)
     }
@@ -57,7 +57,7 @@ enum AppStoragePaths {
     /// Ensures that all required app storage directories exist and are directories.
     /// - Throws: `StoragePathError` when an expected directory is a file,
     ///           or any underlying `FileManager` creation error.
-    static func preparePersistentDirectories() throws {
+    nonisolated(unsafe) static func preparePersistentDirectories() throws {
         let fileManager = FileManager.default
         let requiredDirectories = [appRootDirectory, modelsDirectory, embeddingsDirectory]
 

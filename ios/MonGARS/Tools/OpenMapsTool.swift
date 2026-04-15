@@ -42,7 +42,7 @@ nonisolated final class OpenMapsTool: ToolExecutable, @unchecked Sendable {
             let mapItem = MKMapItem(placemark: MKPlacemark(coordinate: location.coordinate))
             mapItem.name = destination
 
-            await MainActor.run {
+            _ = await MainActor.run {
                 mapItem.openInMaps(launchOptions: [
                     MKLaunchOptionsDirectionsModeKey: MKLaunchOptionsDirectionsModeDriving
                 ])
@@ -59,7 +59,7 @@ nonisolated final class OpenMapsTool: ToolExecutable, @unchecked Sendable {
         let mapItem = MKMapItem(placemark: MKPlacemark(coordinate: coordinate))
         mapItem.name = "Location (\(lat), \(lon))"
 
-        await MainActor.run {
+        _ = await MainActor.run {
             mapItem.openInMaps()
         }
 
@@ -72,7 +72,7 @@ nonisolated final class OpenMapsTool: ToolExecutable, @unchecked Sendable {
             return .failure("Invalid search query")
         }
 
-        await MainActor.run {
+        _ = await MainActor.run {
             UIApplication.shared.open(url)
         }
 
