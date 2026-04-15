@@ -1,7 +1,7 @@
 import Foundation
 import os
 
-enum AppStoragePaths {
+nonisolated enum AppStoragePaths {
     private static let storageMigrationQueue = DispatchQueue(label: "com.mongars.storage.migration")
 
     static let appFolderName = "MonGARS"
@@ -253,7 +253,7 @@ enum AppStoragePaths {
     }
 }
 
-enum StoragePathError: LocalizedError {
+nonisolated enum StoragePathError: LocalizedError, Sendable {
     case pathExistsAsFile(URL)
 
     var errorDescription: String? {

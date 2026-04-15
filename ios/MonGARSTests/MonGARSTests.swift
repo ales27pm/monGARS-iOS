@@ -103,6 +103,124 @@ struct MonGARSTests {
         #expect(plan.requiresStateReset)
     }
 
+    @Test func embeddingStoreSearchUsesBoundedRecentCandidateWindow() async throws {
+        let topK = 1
+        let candidateLimit = EmbeddingStore.searchCandidateLimit(topK: topK)
+
+        try await withTemporaryEmbeddingStore { store in
+            try await store.insertChunk(
+                makeChunk(
+                    id: "old-best",
+                    source: "conversation:bounded",
+                    language: "en",
+                    createdAt: 1,
+                    vector: [1, 0]
+                )
+            )
+
+            for index in 0..<(candidateLimit + 20) {
+                try await store.insertChunk(
+                    makeChunk(
+                        id: "new-\(index)",
+                        source: "conversation:bounded",
+                        language: "en",
+                        createdAt: TimeInterval(index + 2),
+                        vector: [0, 1]
+                    )
+                )
+            }
+
+            let results = try await store.searchSimilar(
+                queryVector: [1, 0],
+                topK: topK,
+                source: "conversation:bounded",
+                language: "en",
+                minScore: -1
+            )
+
+            #expect(results.count == 1)
+            #expect(results.first?.chunk.id != "old-best")
+        }
+    }
+
+    @Test func embeddingStoreSearchLimitPreservesSourceAndLanguageFilters() async throws {
+        let topK = 2
+        let candidateLimit = EmbeddingStore.searchCandidateLimit(topK: topK)
+
+        try await withTemporaryEmbeddingStore { store in
+            try await store.insertChunk(
+                makeChunk(
+                    id: "target-old-best",
+                    source: "conversation:target",
+                    language: "fr",
+                    createdAt: 1,
+                    vector: [1, 0]
+                )
+            )
+
+            for index in 0..<(candidateLimit + 5) {
+                try await store.insertChunk(
+                    makeChunk(
+                        id: "target-new-\(index)",
+                        source: "conversation:target",
+                        language: "fr",
+                        createdAt: TimeInterval(index + 2),
+                        vector: [0, 1]
+                    )
+                )
+            }
+
+            for index in 0..<40 {
+                try await store.insertChunk(
+                    makeChunk(
+                        id: "noise-\(index)",
+                        source: "conversation:other",
+                        language: "en",
+                        createdAt: TimeInterval(index + 10_000),
+                        vector: [1, 0]
+                    )
+                )
+            }
+
+            let results = try await store.searchSimilar(
+                queryVector: [1, 0],
+                topK: topK,
+                source: "conversation:target",
+                language: "fr",
+                minScore: -1
+            )
+
+            #expect(results.count == topK)
+            #expect(results.allSatisfy { $0.chunk.source == "conversation:target" })
+            #expect(results.allSatisfy { $0.chunk.language == "fr" })
+            #expect(results.allSatisfy { $0.chunk.id != "target-old-best" })
+        }
+    }
+
+    @Test func embeddingRequestCacheEvictsLeastRecentlyUsedEntry() {
+        var cache = EmbeddingRequestCache(capacity: 2)
+        cache.insert(makeEmbeddingResult(marker: 1), for: "a")
+        cache.insert(makeEmbeddingResult(marker: 2), for: "b")
+
+        _ = cache.value(for: "a")
+        cache.insert(makeEmbeddingResult(marker: 3), for: "c")
+
+        #expect(cache.count == 2)
+        #expect(cache.value(for: "a") != nil)
+        #expect(cache.value(for: "b") == nil)
+        #expect(cache.value(for: "c") != nil)
+    }
+
+    @Test func embeddingRequestCacheCapacityIsAlwaysBounded() {
+        var cache = EmbeddingRequestCache(capacity: 0)
+        cache.insert(makeEmbeddingResult(marker: 1), for: "a")
+        cache.insert(makeEmbeddingResult(marker: 2), for: "b")
+
+        #expect(cache.count == 1)
+        #expect(cache.value(for: "a") == nil)
+        #expect(cache.value(for: "b") != nil)
+    }
+
     @Test func tokenizerRoundTripEncodeDecode() async throws {
         let fixtureURL = try makeTokenizerFixtureDirectory(
             vocab: makeByteLevelVocab(),
@@ -237,5 +355,53 @@ struct MonGARSTests {
             }
         }
         return vocab
+    }
+
+    private func withTemporaryEmbeddingStore(
+        _ body: (EmbeddingStore) async throws -> Void
+    ) async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("EmbeddingStoreTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let dbURL = root.appendingPathComponent("embeddings.sqlite3")
+        let store = EmbeddingStore(databaseURL: dbURL)
+        try await store.open()
+
+        do {
+            try await body(store)
+            await store.close()
+            try FileManager.default.removeItem(at: root)
+        } catch {
+            await store.close()
+            try? FileManager.default.removeItem(at: root)
+            throw error
+        }
+    }
+
+    private func makeChunk(
+        id: String,
+        source: String,
+        language: String?,
+        createdAt: TimeInterval,
+        vector: [Float]
+    ) -> SemanticChunk {
+        SemanticChunk(
+            id: id,
+            content: "content-\(id)",
+            source: source,
+            language: language,
+            createdAt: Date(timeIntervalSince1970: createdAt),
+            vector: vector,
+            dimensions: vector.count
+        )
+    }
+
+    private func makeEmbeddingResult(marker: Float) -> EmbeddingResult {
+        EmbeddingResult(
+            vector: [marker],
+            dimensions: 1,
+            computeTimeSeconds: 0.01,
+            inputTokenCount: Int(marker)
+        )
     }
 }

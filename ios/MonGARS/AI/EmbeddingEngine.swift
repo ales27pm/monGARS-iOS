@@ -20,6 +20,7 @@ actor EmbeddingEngine {
     private var dimensionCount: Int = 0
     private var currentSourceID: ModelSourceID?
     private var maxContextTokens: Int = 512
+    private var embeddingCache = EmbeddingRequestCache(capacity: 32)
 
     init(diagnostics: InferenceDiagnostics) {
         self.diagnostics = diagnostics
@@ -32,6 +33,7 @@ actor EmbeddingEngine {
     func loadModel(sourceID: ModelSourceID, modelURL: URL, tokenizerDirectory: URL?, contextWindow: Int) async throws {
         guard engineState != .loading else { return }
         engineState = .loading
+        embeddingCache.clear()
 
         let loadStart = CFAbsoluteTimeGetCurrent()
 
@@ -81,6 +83,15 @@ actor EmbeddingEngine {
     func embed(text: String) async throws -> EmbeddingResult {
         guard let model else { throw EmbeddingError.modelNotLoaded }
 
+        if let cached = embeddingCache.value(for: text) {
+            return EmbeddingResult(
+                vector: cached.vector,
+                dimensions: cached.dimensions,
+                computeTimeSeconds: 0,
+                inputTokenCount: cached.inputTokenCount
+            )
+        }
+
         let start = CFAbsoluteTimeGetCurrent()
 
         let inputFeatures: MLDictionaryFeatureProvider
@@ -127,13 +138,14 @@ actor EmbeddingEngine {
 
         let normalized = l2Normalize(vector)
         let elapsed = CFAbsoluteTimeGetCurrent() - start
-
-        return EmbeddingResult(
+        let result = EmbeddingResult(
             vector: normalized,
             dimensions: count,
             computeTimeSeconds: elapsed,
             inputTokenCount: inputTokenCount
         )
+        embeddingCache.insert(result, for: text)
+        return result
     }
 
     func embedBatch(texts: [String]) async throws -> [EmbeddingResult] {
@@ -178,6 +190,7 @@ actor EmbeddingEngine {
         dimensionCount = 0
         currentSourceID = nil
         maxContextTokens = 512
+        embeddingCache.clear()
         engineState = .unloaded
         logger.info("Embedding engine unloaded")
     }
@@ -201,4 +214,49 @@ nonisolated enum EmbeddingError: Error, Sendable {
     case modelNotLoaded
     case invalidOutput
     case textTooLong
+}
+
+nonisolated struct EmbeddingRequestCache: Sendable {
+    private struct Entry: Sendable {
+        var result: EmbeddingResult
+        var accessTick: UInt64
+    }
+
+    private(set) var capacity: Int
+    private var entries: [String: Entry] = [:]
+    private var currentTick: UInt64 = 0
+
+    init(capacity: Int) {
+        self.capacity = max(1, capacity)
+    }
+
+    var count: Int { entries.count }
+
+    mutating func value(for key: String) -> EmbeddingResult? {
+        guard var entry = entries[key] else { return nil }
+        currentTick &+= 1
+        entry.accessTick = currentTick
+        entries[key] = entry
+        return entry.result
+    }
+
+    mutating func insert(_ result: EmbeddingResult, for key: String) {
+        currentTick &+= 1
+        entries[key] = Entry(result: result, accessTick: currentTick)
+        evictIfNeeded()
+    }
+
+    mutating func clear() {
+        entries.removeAll(keepingCapacity: false)
+        currentTick = 0
+    }
+
+    private mutating func evictIfNeeded() {
+        while entries.count > capacity {
+            guard let evictionKey = entries.min(by: { $0.value.accessTick < $1.value.accessTick })?.key else {
+                return
+            }
+            entries.removeValue(forKey: evictionKey)
+        }
+    }
 }

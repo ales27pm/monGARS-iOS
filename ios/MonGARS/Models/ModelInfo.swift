@@ -133,7 +133,7 @@ nonisolated struct ModelSource: Sendable, Identifiable {
     }
 }
 
-struct ModelSourceCatalog: Sendable {
+nonisolated struct ModelSourceCatalog: Sendable {
     static let chatSources: [ModelSource] = [
         ModelSource(
             id: "llama-3.2-3b-4bit",

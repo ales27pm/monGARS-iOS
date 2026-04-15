@@ -3,15 +3,15 @@ import Foundation
 import SQLite3
 import os
 
-@inline(__always)
-private func sqliteTransientDestructor() -> sqlite3_destructor_type? {
-    unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-}
-
 actor EmbeddingStore {
+    private static let minSearchCandidateLimit = 64
+    private static let maxSearchCandidateLimit = 512
+    private static let searchCandidateMultiplier = 24
+
     private var db: OpaquePointer?
     private let dbPath: URL
     private let logger = Logger(subsystem: "com.mongars.memory", category: "storage")
+    private let transientDestructor: sqlite3_destructor_type? = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
     private var storagePreparationError: Error?
 
     init() {
@@ -22,6 +22,25 @@ actor EmbeddingStore {
             logger.error("Failed to prepare embedding storage: \(error.localizedDescription, privacy: .public)")
         }
         self.dbPath = AppStoragePaths.embeddingsDatabaseURL
+    }
+
+    init(databaseURL: URL) {
+        self.dbPath = databaseURL
+        do {
+            try FileManager.default.createDirectory(
+                at: databaseURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+        } catch {
+            storagePreparationError = error
+            logger.error("Failed to prepare embedding storage: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    nonisolated static func searchCandidateLimit(topK: Int) -> Int {
+        let normalizedTopK = max(1, topK)
+        let scaled = normalizedTopK * searchCandidateMultiplier
+        return min(max(scaled, minSearchCandidateLimit), maxSearchCandidateLimit)
     }
 
     func open() throws {
@@ -72,7 +91,7 @@ actor EmbeddingStore {
         }
         defer { sqlite3_finalize(stmt) }
 
-        let transient = sqliteTransientDestructor()
+        let transient = transientDestructor
         guard sqlite3_bind_text(stmt, 1, (chunk.id as NSString).utf8String, -1, transient) == SQLITE_OK,
               sqlite3_bind_text(stmt, 2, (chunk.content as NSString).utf8String, -1, transient) == SQLITE_OK,
               sqlite3_bind_text(stmt, 3, (chunk.source as NSString).utf8String, -1, transient) == SQLITE_OK else {
@@ -102,7 +121,14 @@ actor EmbeddingStore {
     }
 
     func searchSimilar(queryVector: [Float], topK: Int = 5, source: String? = nil, language: String? = nil, minScore: Float = 0.3) throws -> [ScoredChunk] {
-        let chunks = try allChunks(source: source, language: language)
+        guard topK > 0, !queryVector.isEmpty else { return [] }
+
+        let chunks = try candidateChunks(
+            source: source,
+            language: language,
+            dimensions: queryVector.count,
+            limit: Self.searchCandidateLimit(topK: topK)
+        )
         guard !chunks.isEmpty else { return [] }
 
         var scored: [ScoredChunk] = []
@@ -121,16 +147,26 @@ actor EmbeddingStore {
     }
 
     func allChunks(source: String? = nil, language: String? = nil) throws -> [SemanticChunk] {
+        try fetchChunks(source: source, language: language)
+    }
+
+    private func candidateChunks(source: String?, language: String?, dimensions: Int, limit: Int) throws -> [SemanticChunk] {
+        try fetchChunks(source: source, language: language, dimensions: dimensions, limit: limit)
+    }
+
+    private func fetchChunks(source: String? = nil, language: String? = nil, dimensions: Int? = nil, limit: Int? = nil) throws -> [SemanticChunk] {
         guard let db else { throw EmbeddingStoreError.notOpen }
 
         var sql = "SELECT id, content, source, language, created_at, vector, dimensions FROM chunks"
         var conditions: [String] = []
+        if dimensions != nil { conditions.append("dimensions = ?") }
         if source != nil { conditions.append("source = ?") }
         if language != nil { conditions.append("language = ?") }
         if !conditions.isEmpty {
             sql += " WHERE " + conditions.joined(separator: " AND ")
         }
         sql += " ORDER BY created_at DESC"
+        if limit != nil { sql += " LIMIT ?" }
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -139,12 +175,20 @@ actor EmbeddingStore {
         defer { sqlite3_finalize(stmt) }
 
         var bindIdx: Int32 = 1
+        if let dimensions {
+            sqlite3_bind_int(stmt, bindIdx, Int32(dimensions))
+            bindIdx += 1
+        }
         if let source {
-            sqlite3_bind_text(stmt, bindIdx, (source as NSString).utf8String, -1, sqliteTransientDestructor())
+            sqlite3_bind_text(stmt, bindIdx, (source as NSString).utf8String, -1, transientDestructor)
             bindIdx += 1
         }
         if let language {
-            sqlite3_bind_text(stmt, bindIdx, (language as NSString).utf8String, -1, sqliteTransientDestructor())
+            sqlite3_bind_text(stmt, bindIdx, (language as NSString).utf8String, -1, transientDestructor)
+            bindIdx += 1
+        }
+        if let limit {
+            sqlite3_bind_int(stmt, bindIdx, Int32(limit))
         }
 
         var chunks: [SemanticChunk] = []
@@ -189,7 +233,7 @@ actor EmbeddingStore {
             throw EmbeddingStoreError.prepareFailed(String(cString: sqlite3_errmsg(db)))
         }
         defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_text(stmt, 1, (source as NSString).utf8String, -1, sqliteTransientDestructor())
+        sqlite3_bind_text(stmt, 1, (source as NSString).utf8String, -1, transientDestructor)
         sqlite3_step(stmt)
     }
 
