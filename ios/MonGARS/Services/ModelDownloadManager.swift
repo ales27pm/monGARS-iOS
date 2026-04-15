@@ -5,6 +5,8 @@ import os
 @Observable
 @MainActor
 final class ModelDownloadManager {
+    private static let installMarkerFileName = ".install-complete.json"
+
     var llmState: ModelDownloadState = .notDownloaded
     var embeddingState: ModelDownloadState = .notDownloaded
     var selectedChatSourceID: ModelSourceID = ModelSourceCatalog.defaultChatSourceID
@@ -309,6 +311,7 @@ final class ModelDownloadManager {
 
             try validateInstall(modelDir: destDir, source: source)
             try excludeFromBackup(destDir)
+            try writeInstallMarker(for: source, in: destDir)
 
             try? fileManager.removeItem(at: stagingDir)
             try? fileManager.removeItem(at: archiveURL)
@@ -407,6 +410,7 @@ final class ModelDownloadManager {
 
             try validateInstall(modelDir: destDir, source: source)
             try excludeFromBackup(destDir)
+            try writeInstallMarker(for: source, in: destDir)
 
             currentInstallPhase = .complete
             let hasTokenizer = tokResult.filesDownloaded.contains("tokenizer.json")
@@ -665,6 +669,8 @@ final class ModelDownloadManager {
             throw ModelInstallError.validationFailed("Model directory does not exist")
         }
 
+        try validateExpectedArtifactLocation(modelDir: modelDir, source: source)
+
         guard let contents = try? fileManager.contentsOfDirectory(at: modelDir, includingPropertiesForKeys: nil),
               !contents.isEmpty else {
             throw ModelInstallError.validationFailed("Model directory is empty")
@@ -683,6 +689,24 @@ final class ModelDownloadManager {
         let minimumExpected = source.estimatedSizeBytes / 20
         guard dirSize > minimumExpected else {
             throw ModelInstallError.validationFailed("Installed model appears too small (\(dirSize) bytes, expected at least \(minimumExpected))")
+        }
+    }
+
+    private func validateExpectedArtifactLocation(modelDir: URL, source: ModelSource) throws {
+        switch source.downloadStrategy {
+        case .repoDirectory(let modelPath):
+            let expectedURL = modelDir.appendingPathComponent(modelPath)
+            var isDir: ObjCBool = false
+            guard fileManager.fileExists(atPath: expectedURL.path, isDirectory: &isDir) else {
+                throw ModelInstallError.validationFailed("Expected model artifact is missing at \(modelPath)")
+            }
+            if source.artifactType != .zipArchive && !isDir.boolValue {
+                throw ModelInstallError.validationFailed("Expected model artifact path is not a directory: \(modelPath)")
+            }
+        case .archive:
+            break
+        case .unsupported:
+            break
         }
     }
 
@@ -768,6 +792,10 @@ final class ModelDownloadManager {
 
         do {
             try validateInstall(modelDir: dir, source: source)
+            if source.isAvailableForDownload && !hasInstallMarker(in: dir) {
+                try writeInstallMarker(for: source, in: dir)
+                logger.info("Backfilled install marker for validated model \(source.id)")
+            }
             let hasTok = hasTokenizer(for: source.id)
             updateState(for: source.id, state: hasTok ? .installed : .installedMissingTokenizer)
         } catch {
@@ -789,6 +817,10 @@ final class ModelDownloadManager {
             if let src = ModelSourceCatalog.source(for: sourceID) {
                 do {
                     try validateInstall(modelDir: dir, source: src)
+                    if source.isAvailableForDownload, !hasInstallMarker(in: dir) {
+                        try writeInstallMarker(for: src, in: dir)
+                        logger.info("Backfilled install marker during state check for \(sourceID)")
+                    }
                     let hasTok = hasTokenizer(for: sourceID)
                     return hasTok ? .installed : .installedMissingTokenizer
                 } catch {
@@ -856,6 +888,21 @@ final class ModelDownloadManager {
             try fileManager.removeItem(at: url)
         }
         try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
+    }
+
+    private func hasInstallMarker(in modelDir: URL) -> Bool {
+        let markerURL = modelDir.appendingPathComponent(Self.installMarkerFileName)
+        return fileManager.fileExists(atPath: markerURL.path)
+    }
+
+    private func writeInstallMarker(for source: ModelSource, in modelDir: URL) throws {
+        let markerURL = modelDir.appendingPathComponent(Self.installMarkerFileName)
+        let payload: [String: String] = [
+            "sourceID": source.id,
+            "completedAt": ISO8601DateFormatter().string(from: Date()),
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: markerURL, options: .atomic)
     }
 
     private func excludeFromBackup(_ url: URL) throws {

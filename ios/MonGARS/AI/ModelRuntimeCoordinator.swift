@@ -170,6 +170,38 @@ final class ModelRuntimeCoordinator {
         await loadEmbeddingIfAvailable()
     }
 
+    func handleLLMStateTransition(_ newState: ModelDownloadState) async {
+        if newState.isInstalled || newState.isInstalledPartially {
+            if !llmReady {
+                await loadLLMIfAvailable()
+            }
+            return
+        }
+
+        await llmEngine.unloadModel()
+        llmReady = false
+        clearLLMFailureState()
+
+        if newState.isDownloading || newState.isInstalling {
+            runtimeState = .degraded("LLM model download in progress")
+        } else {
+            runtimeState = .degraded("LLM model not downloaded")
+        }
+    }
+
+    func handleEmbeddingStateTransition(_ newState: ModelDownloadState) async {
+        if newState.isInstalled {
+            if !embeddingReady {
+                await loadEmbeddingIfAvailable()
+            }
+            return
+        }
+
+        await embeddingEngine.unloadModel()
+        embeddingReady = false
+        updateRuntimeState()
+    }
+
     func requestChatReloadForSelectionChange() {
         chatReloadTask?.cancel()
         chatReloadTask = Task { @MainActor [weak self] in
