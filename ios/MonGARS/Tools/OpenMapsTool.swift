@@ -42,11 +42,7 @@ nonisolated final class OpenMapsTool: ToolExecutable, @unchecked Sendable {
             let mapItem = MKMapItem(placemark: MKPlacemark(coordinate: location.coordinate))
             mapItem.name = destination
 
-            _ = await MainActor.run {
-                mapItem.openInMaps(launchOptions: [
-                    MKLaunchOptionsDirectionsModeKey: MKLaunchOptionsDirectionsModeDriving
-                ])
-            }
+            await openMapItemForDirections(mapItem)
 
             return .success("Opened Apple Maps with directions to '\(destination)'.")
         } catch {
@@ -59,9 +55,7 @@ nonisolated final class OpenMapsTool: ToolExecutable, @unchecked Sendable {
         let mapItem = MKMapItem(placemark: MKPlacemark(coordinate: coordinate))
         mapItem.name = "Location (\(lat), \(lon))"
 
-        _ = await MainActor.run {
-            mapItem.openInMaps()
-        }
+        await openMapItem(mapItem)
 
         return .success("Opened Apple Maps at coordinates (\(lat), \(lon)).")
     }
@@ -72,10 +66,25 @@ nonisolated final class OpenMapsTool: ToolExecutable, @unchecked Sendable {
             return .failure("Invalid search query")
         }
 
-        _ = await MainActor.run {
-            UIApplication.shared.open(url)
-        }
+        await openMapsURL(url)
 
         return .success("Opened Apple Maps searching for '\(query)'.")
+    }
+
+    @MainActor
+    private func openMapItemForDirections(_ mapItem: MKMapItem) {
+        mapItem.openInMaps(launchOptions: [
+            MKLaunchOptionsDirectionsModeKey: MKLaunchOptionsDirectionsModeDriving
+        ])
+    }
+
+    @MainActor
+    private func openMapItem(_ mapItem: MKMapItem) {
+        mapItem.openInMaps()
+    }
+
+    @MainActor
+    private func openMapsURL(_ url: URL) {
+        UIApplication.shared.open(url)
     }
 }

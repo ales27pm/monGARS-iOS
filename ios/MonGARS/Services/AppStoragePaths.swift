@@ -2,8 +2,7 @@ import Foundation
 import os
 
 enum AppStoragePaths {
-    private static let logger = Logger(subsystem: "com.mongars.storage", category: "paths")
-    private static let fileManager = FileManager.default
+    private static let storageMigrationQueue = DispatchQueue(label: "com.mongars.storage.migration")
 
     static let appFolderName = "MonGARS"
 
@@ -19,12 +18,14 @@ enum AppStoragePaths {
         appRootDirectory.appending(path: "data", directoryHint: .isDirectory)
     }
 
-    nonisolated(unsafe) static var embeddingsDatabaseURL: URL {
+    static var embeddingsDatabaseURL: URL {
         applicationSupportDirectory.appending(path: appFolderName, directoryHint: .isDirectory)
             .appending(path: "embeddings.sqlite3", directoryHint: .notDirectory)
     }
 
     static var applicationSupportDirectory: URL {
+        let fileManager = FileManager.default
+        let logger = Logger(subsystem: "com.mongars.storage", category: "paths")
         do {
             return try fileManager.url(
                 for: .applicationSupportDirectory,
@@ -57,32 +58,41 @@ enum AppStoragePaths {
     /// Ensures that all required app storage directories exist and are directories.
     /// - Throws: `StoragePathError` when an expected directory is a file,
     ///           or any underlying `FileManager` creation error.
-    nonisolated(unsafe) static func preparePersistentDirectories() throws {
-        let fileManager = FileManager.default
-        let requiredDirectories = [appRootDirectory, modelsDirectory, embeddingsDirectory]
-
-        for directory in requiredDirectories {
-            var isDirectory: ObjCBool = false
-            let exists = fileManager.fileExists(atPath: directory.path, isDirectory: &isDirectory)
-            if exists {
-                guard isDirectory.boolValue else {
-                    let error = StoragePathError.pathExistsAsFile(directory)
-                    logger.error("Storage path exists as file: \(directory.path, privacy: .public)")
-                    throw error
-                }
-                continue
-            }
+    static func preparePersistentDirectories() throws {
+        let result: Result<Void, Error> = storageMigrationQueue.sync {
+            let fileManager = FileManager.default
+            let logger = Logger(subsystem: "com.mongars.storage", category: "paths")
+            let requiredDirectories = [appRootDirectory, modelsDirectory, embeddingsDirectory]
 
             do {
-                try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+                for directory in requiredDirectories {
+                    var isDirectory: ObjCBool = false
+                    let exists = fileManager.fileExists(atPath: directory.path, isDirectory: &isDirectory)
+                    if exists {
+                        guard isDirectory.boolValue else {
+                            let error = StoragePathError.pathExistsAsFile(directory)
+                            logger.error("Storage path exists as file: \(directory.path, privacy: .public)")
+                            throw error
+                        }
+                        continue
+                    }
+
+                    do {
+                        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+                    } catch {
+                        logger.error("Failed to create storage directory \(directory.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                        throw error
+                    }
+                }
+
+                try migrateLegacyStorageIfNeeded()
+                applyEmbeddingsFilePermissionsBestEffort()
+                return .success(())
             } catch {
-                logger.error("Failed to create storage directory \(directory.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
-                throw error
+                return .failure(error)
             }
         }
-
-        try migrateLegacyStorageIfNeeded()
-        applyEmbeddingsFilePermissionsBestEffort()
+        try result.get()
     }
 
     private static func migrateLegacyStorageIfNeeded() throws {
@@ -91,6 +101,8 @@ enum AppStoragePaths {
     }
 
     private static func migrateLegacyModelsIfNeeded() throws {
+        let fileManager = FileManager.default
+        let logger = Logger(subsystem: "com.mongars.storage", category: "paths")
         var legacyIsDir: ObjCBool = false
         guard fileManager.fileExists(atPath: legacyModelsDirectory.path, isDirectory: &legacyIsDir), legacyIsDir.boolValue else {
             return
@@ -124,6 +136,8 @@ enum AppStoragePaths {
     }
 
     private static func migrateLegacyEmbeddingsIfNeeded() throws {
+        let fileManager = FileManager.default
+        let logger = Logger(subsystem: "com.mongars.storage", category: "paths")
         if fileManager.fileExists(atPath: embeddingsDatabaseURL.path) {
             return
         }
@@ -139,6 +153,7 @@ enum AppStoragePaths {
     }
 
     private static func migrateSQLiteSidecars(from sourceDB: URL, to destinationDB: URL) throws {
+        let fileManager = FileManager.default
         let suffixes = ["-wal", "-shm"]
         for suffix in suffixes {
             let sourceSidecar = URL(fileURLWithPath: sourceDB.path + suffix)
@@ -151,6 +166,8 @@ enum AppStoragePaths {
     }
 
     private static func applyEmbeddingsFilePermissionsBestEffort() {
+        let fileManager = FileManager.default
+        let logger = Logger(subsystem: "com.mongars.storage", category: "paths")
         do {
             try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: embeddingsDirectory.path)
             if fileManager.fileExists(atPath: embeddingsDatabaseURL.path) {
