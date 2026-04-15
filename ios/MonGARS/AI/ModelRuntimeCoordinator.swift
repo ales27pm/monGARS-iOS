@@ -42,6 +42,8 @@ final class ModelRuntimeCoordinator {
     private var thermalObserver: NSObjectProtocol?
     private var chatReloadTask: Task<Void, Never>?
     private var embeddingReloadTask: Task<Void, Never>?
+    private var llmTransitionTask: Task<Void, Never>?
+    private var embeddingTransitionTask: Task<Void, Never>?
 
     init(modelDownloadManager: ModelDownloadManager) {
         let diag = InferenceDiagnostics()
@@ -171,6 +173,7 @@ final class ModelRuntimeCoordinator {
     }
 
     func handleLLMStateTransition(_ newState: ModelDownloadState) async {
+        guard !Task.isCancelled else { return }
         if newState.isInstalled || newState.isInstalledPartially {
             if !llmReady {
                 await loadLLMIfAvailable()
@@ -190,6 +193,7 @@ final class ModelRuntimeCoordinator {
     }
 
     func handleEmbeddingStateTransition(_ newState: ModelDownloadState) async {
+        guard !Task.isCancelled else { return }
         if newState.isInstalled {
             if !embeddingReady {
                 await loadEmbeddingIfAvailable()
@@ -200,6 +204,22 @@ final class ModelRuntimeCoordinator {
         await embeddingEngine.unloadModel()
         embeddingReady = false
         updateRuntimeState()
+    }
+
+    func enqueueLLMTransition(_ newState: ModelDownloadState) {
+        llmTransitionTask?.cancel()
+        llmTransitionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.handleLLMStateTransition(newState)
+        }
+    }
+
+    func enqueueEmbeddingTransition(_ newState: ModelDownloadState) {
+        embeddingTransitionTask?.cancel()
+        embeddingTransitionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.handleEmbeddingStateTransition(newState)
+        }
     }
 
     func requestChatReloadForSelectionChange() {

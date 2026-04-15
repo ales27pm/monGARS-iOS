@@ -54,15 +54,11 @@ struct ContentView: View {
                 }
                 .onChange(of: modelDownloadManager.llmState) { _, newState in
                     guard let coordinator = runtimeCoordinator else { return }
-                    Task {
-                        await coordinator.handleLLMStateTransition(newState)
-                    }
+                    coordinator.enqueueLLMTransition(newState)
                 }
                 .onChange(of: modelDownloadManager.embeddingState) { _, newState in
                     guard let coordinator = runtimeCoordinator else { return }
-                    Task {
-                        await coordinator.handleEmbeddingStateTransition(newState)
-                    }
+                    coordinator.enqueueEmbeddingTransition(newState)
                 }
                 .onChange(of: modelDownloadManager.selectedChatSourceID) { _, _ in
                     guard let coordinator = runtimeCoordinator else { return }
