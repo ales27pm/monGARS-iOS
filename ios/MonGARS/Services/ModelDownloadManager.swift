@@ -25,7 +25,6 @@ final class ModelDownloadManager {
     init() {
         do {
             try AppStoragePaths.preparePersistentDirectories()
-            try migrateLegacyModelsIfNeeded()
         } catch {
             llmState = .error("Storage initialization failed: \(error.localizedDescription)")
             embeddingState = .error("Storage initialization failed: \(error.localizedDescription)")
@@ -274,50 +273,6 @@ final class ModelDownloadManager {
         progressObservations[sourceID] = observation
         activeTasks[sourceID] = task
         task.resume()
-    }
-
-    // MARK: - Legacy Migration
-
-    private func migrateLegacyModelsIfNeeded() throws {
-        let legacyModelsDirectory = URL.documentsDirectory.appending(path: "models", directoryHint: .isDirectory)
-        let newModelsDirectory = AppStoragePaths.modelsDirectory
-
-        var legacyIsDir: ObjCBool = false
-        guard fileManager.fileExists(atPath: legacyModelsDirectory.path, isDirectory: &legacyIsDir), legacyIsDir.boolValue else {
-            return
-        }
-
-        var newIsDir: ObjCBool = false
-        let newExists = fileManager.fileExists(atPath: newModelsDirectory.path, isDirectory: &newIsDir)
-        if !newExists {
-            try fileManager.moveItem(at: legacyModelsDirectory, to: newModelsDirectory)
-            logger.info("Migrated legacy models directory to new app folder")
-            return
-        }
-
-        guard newIsDir.boolValue else {
-            throw StoragePathError.pathExistsAsFile(newModelsDirectory)
-        }
-
-        let legacyItems = try fileManager.contentsOfDirectory(at: legacyModelsDirectory, includingPropertiesForKeys: nil)
-        guard !legacyItems.isEmpty else {
-            try? fileManager.removeItem(at: legacyModelsDirectory)
-            return
-        }
-
-        for legacyItem in legacyItems {
-            let destination = newModelsDirectory.appendingPathComponent(legacyItem.lastPathComponent)
-            if fileManager.fileExists(atPath: destination.path) {
-                logger.warning("Skipping migration for existing model item at \(destination.path, privacy: .public)")
-                continue
-            }
-            try fileManager.moveItem(at: legacyItem, to: destination)
-        }
-
-        let remainingLegacyItems = (try? fileManager.contentsOfDirectory(at: legacyModelsDirectory, includingPropertiesForKeys: nil)) ?? []
-        if remainingLegacyItems.isEmpty {
-            try? fileManager.removeItem(at: legacyModelsDirectory)
-        }
     }
 
     private func installArchive(archiveURL: URL, sourceID: ModelSourceID) async {

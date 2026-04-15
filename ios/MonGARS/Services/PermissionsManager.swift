@@ -31,6 +31,7 @@ final class PermissionsManager {
     var locationAuthorized: Bool = false
     var notificationsGranted: Bool = false
     private let locationManager = CLLocationManager()
+    private var locationPermissionContinuation: CheckedContinuation<Bool, Never>?
 
     init() {
         locationManager.delegate = self
@@ -91,12 +92,26 @@ final class PermissionsManager {
         }
     }
 
-    func requestLocationAccess() {
-        locationManager.requestWhenInUseAuthorization()
+    func requestLocationAccess() async -> Bool {
+        let currentStatus = locationManager.authorizationStatus
+        if currentStatus == .authorizedWhenInUse || currentStatus == .authorizedAlways {
+            locationAuthorized = true
+            return true
+        }
+        if currentStatus == .denied || currentStatus == .restricted {
+            locationAuthorized = false
+            return false
+        }
+
+        return await withCheckedContinuation { continuation in
+            locationPermissionContinuation?.resume(returning: locationAuthorized)
+            locationPermissionContinuation = continuation
+            locationManager.requestWhenInUseAuthorization()
+        }
     }
 
     func requestAllNativeFeaturePermissions() async {
-        requestLocationAccess()
+        _ = await requestLocationAccess()
         await requestNotificationAccess()
         await requestContactsAccess()
         await requestCalendarAccess()
@@ -180,6 +195,9 @@ extension PermissionsManager: @preconcurrency CLLocationManagerDelegate {
             guard let self else { return }
             let status = manager.authorizationStatus
             self.locationAuthorized = status == .authorizedWhenInUse || status == .authorizedAlways
+            guard status != .notDetermined else { return }
+            self.locationPermissionContinuation?.resume(returning: self.locationAuthorized)
+            self.locationPermissionContinuation = nil
         }
     }
 }
