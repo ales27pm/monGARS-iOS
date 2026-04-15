@@ -3,7 +3,10 @@ import Foundation
 import SQLite3
 import os
 
-private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+@inline(__always)
+private func sqliteTransientDestructor() -> sqlite3_destructor_type? {
+    unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+}
 
 actor EmbeddingStore {
     private var db: OpaquePointer?
@@ -69,19 +72,27 @@ actor EmbeddingStore {
         }
         defer { sqlite3_finalize(stmt) }
 
-        sqlite3_bind_text(stmt, 1, (chunk.id as NSString).utf8String, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_text(stmt, 2, (chunk.content as NSString).utf8String, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_text(stmt, 3, (chunk.source as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        let transient = sqliteTransientDestructor()
+        guard sqlite3_bind_text(stmt, 1, (chunk.id as NSString).utf8String, -1, transient) == SQLITE_OK,
+              sqlite3_bind_text(stmt, 2, (chunk.content as NSString).utf8String, -1, transient) == SQLITE_OK,
+              sqlite3_bind_text(stmt, 3, (chunk.source as NSString).utf8String, -1, transient) == SQLITE_OK else {
+            throw EmbeddingStoreError.bindFailed(String(cString: sqlite3_errmsg(db)))
+        }
         if let lang = chunk.language {
-            sqlite3_bind_text(stmt, 4, (lang as NSString).utf8String, -1, SQLITE_TRANSIENT)
+            guard sqlite3_bind_text(stmt, 4, (lang as NSString).utf8String, -1, transient) == SQLITE_OK else {
+                throw EmbeddingStoreError.bindFailed(String(cString: sqlite3_errmsg(db)))
+            }
         } else {
             sqlite3_bind_null(stmt, 4)
         }
         sqlite3_bind_double(stmt, 5, chunk.createdAt.timeIntervalSince1970)
 
         let vectorData = chunk.vector.withUnsafeBufferPointer { Data(buffer: $0) }
-        vectorData.withUnsafeBytes { raw in
-            sqlite3_bind_blob(stmt, 6, raw.baseAddress, Int32(raw.count), SQLITE_TRANSIENT)
+        let blobBindResult = vectorData.withUnsafeBytes { raw in
+            sqlite3_bind_blob(stmt, 6, raw.baseAddress, Int32(raw.count), transient)
+        }
+        guard blobBindResult == SQLITE_OK else {
+            throw EmbeddingStoreError.bindFailed(String(cString: sqlite3_errmsg(db)))
         }
         sqlite3_bind_int(stmt, 7, Int32(chunk.dimensions))
 
@@ -129,11 +140,11 @@ actor EmbeddingStore {
 
         var bindIdx: Int32 = 1
         if let source {
-            sqlite3_bind_text(stmt, bindIdx, (source as NSString).utf8String, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, bindIdx, (source as NSString).utf8String, -1, sqliteTransientDestructor())
             bindIdx += 1
         }
         if let language {
-            sqlite3_bind_text(stmt, bindIdx, (language as NSString).utf8String, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, bindIdx, (language as NSString).utf8String, -1, sqliteTransientDestructor())
         }
 
         var chunks: [SemanticChunk] = []
@@ -178,7 +189,7 @@ actor EmbeddingStore {
             throw EmbeddingStoreError.prepareFailed(String(cString: sqlite3_errmsg(db)))
         }
         defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_text(stmt, 1, (source as NSString).utf8String, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 1, (source as NSString).utf8String, -1, sqliteTransientDestructor())
         sqlite3_step(stmt)
     }
 
@@ -254,6 +265,7 @@ nonisolated enum EmbeddingStoreError: Error, Sendable {
     case openFailed(String)
     case notOpen
     case prepareFailed(String)
+    case bindFailed(String)
     case insertFailed(String)
     case execFailed(String)
 }
