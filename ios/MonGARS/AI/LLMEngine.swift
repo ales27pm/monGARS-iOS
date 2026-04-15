@@ -17,6 +17,12 @@ nonisolated enum LLMEngineState: Sendable, Equatable {
 }
 
 actor LLMEngine {
+    struct ContextWindowPlan: Equatable, Sendable {
+        let tokensForPrediction: [Int]
+        let didTruncate: Bool
+        let requiresStateReset: Bool
+    }
+
     private let logger = Logger(subsystem: "com.mongars.ai", category: "llm")
     private let diagnostics: InferenceDiagnostics
 
@@ -35,6 +41,29 @@ actor LLMEngine {
     var currentState: LLMEngineState { engineState }
     var isReady: Bool { engineState == .ready }
     var loadedSourceID: ModelSourceID? { currentSourceID }
+
+    static func isStatefulModel(stateDescriptionNames: some Collection<String>) -> Bool {
+        !stateDescriptionNames.isEmpty
+    }
+
+    static func shouldResetStateForFreshGeneration(isStateful: Bool) -> Bool {
+        isStateful
+    }
+
+    static func makeContextWindowPlan(tokens: [Int], contextWindow: Int, isStateful: Bool) -> ContextWindowPlan {
+        guard !tokens.isEmpty else {
+            return ContextWindowPlan(tokensForPrediction: [], didTruncate: false, requiresStateReset: false)
+        }
+
+        let safeWindow = max(contextWindow, 1)
+        let maxTokensForPrediction = max(safeWindow - 1, 1)
+        guard tokens.count > maxTokensForPrediction else {
+            return ContextWindowPlan(tokensForPrediction: tokens, didTruncate: false, requiresStateReset: false)
+        }
+
+        let truncated = Array(tokens.suffix(maxTokensForPrediction))
+        return ContextWindowPlan(tokensForPrediction: truncated, didTruncate: true, requiresStateReset: isStateful)
+    }
 
     func loadModel(sourceID: ModelSourceID, modelURL: URL, tokenizerDirectory: URL, contextWindow: Int) async throws {
         guard engineState != .loading else { return }
@@ -64,10 +93,12 @@ actor LLMEngine {
 
             let loadedModel = try await MLModel.load(contentsOf: compiledURL, configuration: config)
 
-            isStateful = hasStatefulKVCache(loadedModel)
+            isStateful = hasModelState(loadedModel)
             if isStateful {
                 state = loadedModel.makeState()
-                logger.info("Stateful KV-cache detected and initialized for \(sourceID)")
+                logger.info("Stateful model state detected and initialized for \(sourceID)")
+            } else {
+                state = nil
             }
 
             self.model = loadedModel
@@ -127,6 +158,7 @@ actor LLMEngine {
 
         engineState = .generating
         defer { engineState = .ready }
+        prepareForFreshGenerationIfNeeded()
 
         let genStart = CFAbsoluteTimeGetCurrent()
         let inputTokens = await tokenizer.encode(prompt)
@@ -147,9 +179,12 @@ actor LLMEngine {
                 break
             }
 
-            if generatedTokens.count >= contextWindow {
-                let overflow = generatedTokens.count - contextWindow + 1
-                generatedTokens.removeFirst(overflow)
+            let stepPlan = Self.makeContextWindowPlan(tokens: generatedTokens, contextWindow: contextWindow, isStateful: isStateful)
+            if stepPlan.didTruncate {
+                generatedTokens = stepPlan.tokensForPrediction
+                if stepPlan.requiresStateReset {
+                    resetKVCache()
+                }
             }
 
             let logits = try await predictNextTokenLogits(tokens: generatedTokens)
@@ -241,6 +276,7 @@ actor LLMEngine {
         }
 
         engineState = .generating
+        prepareForFreshGenerationIfNeeded()
         let genStart = CFAbsoluteTimeGetCurrent()
 
         let inputTokens = await tokenizer.encode(prompt)
@@ -262,9 +298,12 @@ actor LLMEngine {
                     break
                 }
 
-                if generatedTokens.count >= contextWindow {
-                    let overflow = generatedTokens.count - contextWindow + 1
-                    generatedTokens.removeFirst(overflow)
+                let stepPlan = Self.makeContextWindowPlan(tokens: generatedTokens, contextWindow: contextWindow, isStateful: isStateful)
+                if stepPlan.didTruncate {
+                    generatedTokens = stepPlan.tokensForPrediction
+                    if stepPlan.requiresStateReset {
+                        resetKVCache()
+                    }
                 }
 
                 let logits = try await predictNextTokenLogits(tokens: generatedTokens)
@@ -320,8 +359,9 @@ actor LLMEngine {
     private func predictNextTokenLogits(tokens: [Int]) async throws -> [Float] {
         guard let model else { throw LLMError.modelNotLoaded }
 
-        let maxLength = currentContextWindow
+        let maxLength = max(currentContextWindow, 1)
         let inputLength = min(tokens.count, maxLength)
+        guard inputLength > 0 else { throw LLMError.contextOverflow }
         let truncatedTokens = Array(tokens.suffix(inputLength))
 
         let inputArray = try MLMultiArray(shape: [1, NSNumber(value: inputLength)], dataType: .int32)
@@ -521,9 +561,13 @@ actor LLMEngine {
 
     // MARK: - Model Inspection
 
-    private func hasStatefulKVCache(_ model: MLModel) -> Bool {
-        let stateDesc = model.modelDescription.stateDescriptionsByName
-        return stateDesc["keyCache"] != nil || stateDesc["key_cache"] != nil
+    private func hasModelState(_ model: MLModel) -> Bool {
+        Self.isStatefulModel(stateDescriptionNames: model.modelDescription.stateDescriptionsByName.keys)
+    }
+
+    private func prepareForFreshGenerationIfNeeded() {
+        guard Self.shouldResetStateForFreshGeneration(isStateful: isStateful) else { return }
+        resetKVCache()
     }
 
     private func computeUnitsForCurrentDevice() -> MLComputeUnits {

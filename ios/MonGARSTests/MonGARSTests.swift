@@ -64,6 +64,45 @@ struct MonGARSTests {
         #expect(state == .notDownloaded)
     }
 
+    @Test func llmEngineStatefulDetectionUsesAnyModelStateDescription() {
+        #expect(LLMEngine.isStatefulModel(stateDescriptionNames: [String]()) == false)
+        #expect(LLMEngine.isStatefulModel(stateDescriptionNames: ["keyCache"]))
+        #expect(LLMEngine.isStatefulModel(stateDescriptionNames: ["decoder_state", "attention_cache"]))
+    }
+
+    @Test func llmEngineFreshGenerationResetPolicyDependsOnStatefulness() {
+        #expect(LLMEngine.shouldResetStateForFreshGeneration(isStateful: true))
+        #expect(LLMEngine.shouldResetStateForFreshGeneration(isStateful: false) == false)
+    }
+
+    @Test func llmEngineContextOverflowPlanTruncatesAndSignalsResetForStatefulModels() {
+        let tokens = Array(0..<10)
+        let plan = LLMEngine.makeContextWindowPlan(tokens: tokens, contextWindow: 8, isStateful: true)
+
+        #expect(plan.didTruncate)
+        #expect(plan.requiresStateReset)
+        #expect(plan.tokensForPrediction.count == 7)
+        #expect(plan.tokensForPrediction == Array(3..<10))
+    }
+
+    @Test func llmEngineContextOverflowPlanTruncatesWithoutResetForStatelessModels() {
+        let tokens = Array(0..<10)
+        let plan = LLMEngine.makeContextWindowPlan(tokens: tokens, contextWindow: 8, isStateful: false)
+
+        #expect(plan.didTruncate)
+        #expect(plan.requiresStateReset == false)
+        #expect(plan.tokensForPrediction == Array(3..<10))
+    }
+
+    @Test func llmEngineContextOverflowPlanHandlesSmallContextWindowSafely() {
+        let tokens = [11, 22, 33]
+        let plan = LLMEngine.makeContextWindowPlan(tokens: tokens, contextWindow: 1, isStateful: true)
+
+        #expect(plan.didTruncate)
+        #expect(plan.tokensForPrediction == [33])
+        #expect(plan.requiresStateReset)
+    }
+
     @Test func tokenizerRoundTripEncodeDecode() async throws {
         let fixtureURL = try makeTokenizerFixtureDirectory(
             vocab: makeByteLevelVocab(),
