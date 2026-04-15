@@ -9,6 +9,7 @@ struct SettingsView: View {
             chatModelSection
             embeddingSection
             networkSection
+            nativePermissionsSection
             voiceSection
             privacySection
             aboutSection
@@ -315,6 +316,37 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Native Permissions
+
+    private var nativePermissionsSection: some View {
+        Section {
+            ForEach(viewModel.permissionsManager.nativePermissionStatuses) { status in
+                permissionStatusRow(
+                    title: viewModel.permissionsManager.nativeFeatureTitle(status.feature, localeManager: viewModel.localeManager),
+                    granted: status.granted
+                )
+            }
+
+            if !viewModel.permissionsManager.allNativeFeaturePermissionsGranted {
+                Button {
+                    Task { await viewModel.requestAllNativeFeaturePermissions() }
+                } label: {
+                    Label(
+                        viewModel.localeManager.localizedString("Grant All Native Permissions", "Accorder toutes les permissions natives"),
+                        systemImage: "checkmark.shield"
+                    )
+                }
+            }
+        } header: {
+            Text(viewModel.localeManager.localizedString("Native Features", "Fonctionnalités natives"))
+        } footer: {
+            Text(viewModel.localeManager.localizedString(
+                "Grant access to all built-in tools used by MonGARS (location, contacts, calendar, reminders, and notifications).",
+                "Accorde l'accès à tous les outils natifs utilisés par MonGARS (localisation, contacts, calendrier, rappels et notifications)."
+            ))
+        }
+    }
+
     // MARK: - Privacy
 
     private var privacySection: some View {
@@ -415,6 +447,17 @@ struct SettingsView: View {
         case .error:
             Image(systemName: "exclamationmark.triangle")
                 .foregroundStyle(.red)
+        }
+    }
+
+    private func permissionStatusRow(title: String, granted: Bool) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(granted
+                 ? viewModel.localeManager.localizedString("Granted", "Accordé")
+                 : viewModel.localeManager.localizedString("Not Granted", "Non accordé"))
+                .foregroundStyle(granted ? .green : .secondary)
         }
     }
 }

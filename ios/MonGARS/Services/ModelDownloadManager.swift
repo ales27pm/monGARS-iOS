@@ -23,6 +23,15 @@ final class ModelDownloadManager {
     private let fileManager = FileManager.default
 
     init() {
+        do {
+            try AppStoragePaths.preparePersistentDirectories()
+        } catch {
+            llmState = .error("Storage initialization failed: \(error.localizedDescription)")
+            embeddingState = .error("Storage initialization failed: \(error.localizedDescription)")
+            lastDiagnosticMessage = "Storage initialization failed: \(error.localizedDescription)"
+            logger.error("Failed to prepare persistent directories: \(error.localizedDescription, privacy: .public)")
+            return
+        }
         checkExistingModels()
     }
 
@@ -133,7 +142,7 @@ final class ModelDownloadManager {
     }
 
     func modelsBaseDirectory() -> URL {
-        URL.documentsDirectory.appending(path: "models", directoryHint: .isDirectory)
+        AppStoragePaths.modelsDirectory
     }
 
     func modelDirectory(for sourceID: ModelSourceID) -> URL {
@@ -163,7 +172,7 @@ final class ModelDownloadManager {
     }
 
     var availableDiskSpaceBytes: Int64 {
-        let path = URL.documentsDirectory
+        let path = AppStoragePaths.appRootDirectory
         guard let values = try? path.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
               let available = values.volumeAvailableCapacityForImportantUsage else {
             return 0

@@ -8,6 +8,21 @@ import UserNotifications
 @Observable
 @MainActor
 final class PermissionsManager {
+    struct NativePermissionStatus: Identifiable, Sendable {
+        let feature: NativeFeature
+        let granted: Bool
+
+        var id: NativeFeature { feature }
+    }
+
+    enum NativeFeature: CaseIterable, Sendable {
+        case location
+        case contacts
+        case calendar
+        case reminders
+        case notifications
+    }
+
     var microphoneGranted: Bool = false
     var speechRecognitionGranted: Bool = false
     var contactsGranted: Bool = false
@@ -15,8 +30,11 @@ final class PermissionsManager {
     var remindersGranted: Bool = false
     var locationAuthorized: Bool = false
     var notificationsGranted: Bool = false
+    private let locationManager = CLLocationManager()
+    private var locationPermissionContinuation: CheckedContinuation<Bool, Never>?
 
     init() {
+        locationManager.delegate = self
         checkCurrentStatus()
     }
 
@@ -74,6 +92,33 @@ final class PermissionsManager {
         }
     }
 
+    func requestLocationAccess() async -> Bool {
+        let currentStatus = locationManager.authorizationStatus
+        if currentStatus == .authorizedWhenInUse || currentStatus == .authorizedAlways {
+            locationAuthorized = true
+            return true
+        }
+        if currentStatus == .denied || currentStatus == .restricted {
+            locationAuthorized = false
+            return false
+        }
+
+        return await withCheckedContinuation { continuation in
+            locationPermissionContinuation?.resume(returning: locationAuthorized)
+            locationPermissionContinuation = continuation
+            locationManager.requestWhenInUseAuthorization()
+        }
+    }
+
+    func requestAllNativeFeaturePermissions() async {
+        _ = await requestLocationAccess()
+        await requestNotificationAccess()
+        await requestContactsAccess()
+        await requestCalendarAccess()
+        await requestRemindersAccess()
+        checkCurrentStatus()
+    }
+
     func requestAllVoicePermissions() async {
         await requestMicrophoneAccess()
         await requestSpeechRecognition()
@@ -81,6 +126,16 @@ final class PermissionsManager {
 
     var canUseVoice: Bool {
         microphoneGranted && speechRecognitionGranted
+    }
+
+    var nativePermissionStatuses: [NativePermissionStatus] {
+        NativeFeature.allCases.map { feature in
+            NativePermissionStatus(feature: feature, granted: isNativePermissionGranted(feature))
+        }
+    }
+
+    var allNativeFeaturePermissionsGranted: Bool {
+        NativeFeature.allCases.allSatisfy(isNativePermissionGranted(_:))
     }
 
     func refreshAll() {
@@ -94,12 +149,55 @@ final class PermissionsManager {
         calendarGranted = EKEventStore.authorizationStatus(for: .event) == .fullAccess
         remindersGranted = EKEventStore.authorizationStatus(for: .reminder) == .fullAccess
 
-        let locStatus = CLLocationManager().authorizationStatus
+        let locStatus = locationManager.authorizationStatus
         locationAuthorized = locStatus == .authorizedWhenInUse || locStatus == .authorizedAlways
 
         Task {
             let settings = await UNUserNotificationCenter.current().notificationSettings()
             notificationsGranted = settings.authorizationStatus == .authorized
+        }
+    }
+
+    func nativeFeatureTitle(_ feature: NativeFeature, localeManager: LocaleManager) -> String {
+        switch feature {
+        case .location:
+            return localeManager.localizedString("Location", "Localisation")
+        case .contacts:
+            return localeManager.localizedString("Contacts", "Contacts")
+        case .calendar:
+            return localeManager.localizedString("Calendar", "Calendrier")
+        case .reminders:
+            return localeManager.localizedString("Reminders", "Rappels")
+        case .notifications:
+            return localeManager.localizedString("Notifications", "Notifications")
+        }
+    }
+
+    private func isNativePermissionGranted(_ feature: NativeFeature) -> Bool {
+        switch feature {
+        case .location:
+            return locationAuthorized
+        case .contacts:
+            return contactsGranted
+        case .calendar:
+            return calendarGranted
+        case .reminders:
+            return remindersGranted
+        case .notifications:
+            return notificationsGranted
+        }
+    }
+}
+
+extension PermissionsManager: @preconcurrency CLLocationManagerDelegate {
+    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let status = manager.authorizationStatus
+            self.locationAuthorized = status == .authorizedWhenInUse || status == .authorizedAlways
+            guard status != .notDetermined else { return }
+            self.locationPermissionContinuation?.resume(returning: self.locationAuthorized)
+            self.locationPermissionContinuation = nil
         }
     }
 }

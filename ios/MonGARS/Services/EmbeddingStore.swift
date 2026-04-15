@@ -1,19 +1,31 @@
 import Accelerate
 import Foundation
 import SQLite3
+import os
 
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
 actor EmbeddingStore {
     private var db: OpaquePointer?
     private let dbPath: URL
+    private let logger = Logger(subsystem: "com.mongars.memory", category: "storage")
+    private var storagePreparationError: Error?
 
     init() {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        self.dbPath = docs.appendingPathComponent("embeddings.sqlite3")
+        do {
+            try AppStoragePaths.preparePersistentDirectories()
+        } catch {
+            storagePreparationError = error
+            logger.error("Failed to prepare embedding storage: \(error.localizedDescription, privacy: .public)")
+        }
+        self.dbPath = AppStoragePaths.embeddingsDatabaseURL
     }
 
     func open() throws {
+        if let storagePreparationError {
+            throw EmbeddingStoreError.storageSetupFailed(storagePreparationError.localizedDescription)
+        }
+
         guard sqlite3_open(dbPath.path, &db) == SQLITE_OK else {
             let msg = db.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown"
             throw EmbeddingStoreError.openFailed(msg)
@@ -209,6 +221,7 @@ actor EmbeddingStore {
             throw EmbeddingStoreError.execFailed(msg)
         }
     }
+
 }
 
 nonisolated struct SemanticChunk: Sendable {
@@ -237,6 +250,7 @@ nonisolated struct ScoredChunk: Sendable {
 }
 
 nonisolated enum EmbeddingStoreError: Error, Sendable {
+    case storageSetupFailed(String)
     case openFailed(String)
     case notOpen
     case prepareFailed(String)
