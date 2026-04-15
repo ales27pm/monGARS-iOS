@@ -14,6 +14,7 @@ actor EmbeddingStore {
     init() {
         do {
             try AppStoragePaths.preparePersistentDirectories()
+            try migrateLegacyEmbeddingsIfNeeded()
         } catch {
             storagePreparationError = error
             logger.error("Failed to prepare embedding storage: \(error.localizedDescription, privacy: .public)")
@@ -220,6 +221,30 @@ actor EmbeddingStore {
             sqlite3_free(errMsg)
             throw EmbeddingStoreError.execFailed(msg)
         }
+    }
+
+    private func migrateLegacyEmbeddingsIfNeeded() throws {
+        let legacyDBURL = URL.documentsDirectory.appending(path: "embeddings.sqlite3", directoryHint: .notDirectory)
+        let newDBURL = AppStoragePaths.embeddingsDatabaseURL
+        let helperFiles = ["-wal", "-shm"]
+
+        guard FileManager.default.fileExists(atPath: legacyDBURL.path) else { return }
+        if FileManager.default.fileExists(atPath: newDBURL.path) {
+            logger.info("Skipping legacy embeddings migration because new database already exists")
+            return
+        }
+
+        try FileManager.default.moveItem(at: legacyDBURL, to: newDBURL)
+
+        for suffix in helperFiles {
+            let legacyHelper = URL(fileURLWithPath: legacyDBURL.path + suffix)
+            let newHelper = URL(fileURLWithPath: newDBURL.path + suffix)
+            if FileManager.default.fileExists(atPath: legacyHelper.path), !FileManager.default.fileExists(atPath: newHelper.path) {
+                try FileManager.default.moveItem(at: legacyHelper, to: newHelper)
+            }
+        }
+
+        logger.info("Migrated legacy embeddings database to new app folder")
     }
 }
 
