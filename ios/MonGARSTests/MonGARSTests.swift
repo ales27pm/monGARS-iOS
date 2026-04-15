@@ -7,6 +7,7 @@
 
 import Testing
 @testable import MonGARS
+import Foundation
 
 struct MonGARSTests {
     @Test func retryPlannerRetriesTransientFailuresWithExponentialBackoff() {
@@ -61,5 +62,141 @@ struct MonGARSTests {
 
         state = ModelDownloadStateReducer.reduce(state, event: .cancelled)
         #expect(state == .notDownloaded)
+    }
+
+    @Test func tokenizerRoundTripEncodeDecode() async throws {
+        let fixtureURL = try makeTokenizerFixtureDirectory(
+            vocab: makeByteLevelVocab(),
+            addedTokens: [
+                (token: "<|begin_of_text|>", id: 300_000),
+                (token: "<|eot_id|>", id: 300_001),
+                (token: "<|start_header_id|>", id: 300_002),
+                (token: "<|end_header_id|>", id: 300_003)
+            ],
+            config: [
+                "bos_token": "<|begin_of_text|>",
+                "eos_token": "<|eot_id|>"
+            ]
+        )
+        defer { try? FileManager.default.removeItem(at: fixtureURL) }
+
+        let tokenizer = TokenizerService()
+        try await tokenizer.load(from: fixtureURL)
+
+        let sample = "monGARS says hello 42!"
+        let encoded = await tokenizer.encode(sample)
+        let bosID = await tokenizer.bosTokenId
+        #expect(encoded.first == bosID)
+        #expect(encoded.count > 1)
+
+        let decoded = await tokenizer.decode(encoded)
+        #expect(decoded == sample)
+    }
+
+    @Test func tokenizerInfersSpecialTokenIDsFromKnownAddedTokens() async throws {
+        let fixtureURL = try makeTokenizerFixtureDirectory(
+            vocab: makeByteLevelVocab(),
+            addedTokens: [
+                (token: "<|begin_of_text|>", id: 410_000),
+                (token: "<|end_of_text|>", id: 410_001)
+            ],
+            config: [
+                "model_max_length": 2048
+            ]
+        )
+        defer { try? FileManager.default.removeItem(at: fixtureURL) }
+
+        let tokenizer = TokenizerService()
+        try await tokenizer.load(from: fixtureURL)
+
+        #expect(await tokenizer.bosTokenId == 410_000)
+        #expect(await tokenizer.eosTokenId == 410_001)
+    }
+
+    @Test func tokenizerRejectsStructurallyValidButSemanticallyBrokenData() async throws {
+        let fixtureURL = try makeTokenizerFixtureDirectory(
+            vocab: ["x": 0],
+            addedTokens: [
+                (token: "<|begin_of_text|>", id: 500_000),
+                (token: "<|eot_id|>", id: 500_001)
+            ],
+            config: [
+                "bos_token": "<|begin_of_text|>",
+                "eos_token": "<|eot_id|>"
+            ]
+        )
+        defer { try? FileManager.default.removeItem(at: fixtureURL) }
+
+        let tokenizer = TokenizerService()
+
+        do {
+            try await tokenizer.load(from: fixtureURL)
+            Issue.record("Expected semantic tokenizer validation failure, but load succeeded")
+        } catch let error as TokenizerError {
+            guard case .semanticValidationFailed(let reason) = error else {
+                Issue.record("Expected semantic validation error, got: \(error.localizedDescription)")
+                return
+            }
+            #expect(reason.contains("Readiness probe"))
+        } catch {
+            Issue.record("Unexpected error type: \(error.localizedDescription)")
+        }
+    }
+
+    private func makeTokenizerFixtureDirectory(
+        vocab: [String: Int],
+        addedTokens: [(token: String, id: Int)],
+        config: [String: Any]? = nil,
+        specialTokensMap: [String: Any]? = nil
+    ) throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("TokenizerFixture-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let tokenizerJSON: [String: Any] = [
+            "model": [
+                "vocab": vocab,
+                "merges": [String]()
+            ],
+            "added_tokens": addedTokens.map { ["id": $0.id, "content": $0.token] }
+        ]
+
+        try writeJSON(tokenizerJSON, to: directory.appendingPathComponent("tokenizer.json"))
+
+        if let config {
+            try writeJSON(config, to: directory.appendingPathComponent("tokenizer_config.json"))
+        }
+        if let specialTokensMap {
+            try writeJSON(specialTokensMap, to: directory.appendingPathComponent("special_tokens_map.json"))
+        }
+
+        return directory
+    }
+
+    private func writeJSON(_ value: [String: Any], to url: URL) throws {
+        let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+        try data.write(to: url, options: .atomic)
+    }
+
+    private func makeByteLevelVocab() -> [String: Int] {
+        var byteEncoder: [Int: String] = [:]
+
+        for byte in 33...126 { byteEncoder[byte] = String(UnicodeScalar(byte)!) }
+        for byte in 161...172 { byteEncoder[byte] = String(UnicodeScalar(byte)!) }
+        for byte in 174...255 { byteEncoder[byte] = String(UnicodeScalar(byte)!) }
+
+        var extraScalar = 256
+        for byte in 0...255 where byteEncoder[byte] == nil {
+            byteEncoder[byte] = String(UnicodeScalar(extraScalar)!)
+            extraScalar += 1
+        }
+
+        var vocab: [String: Int] = [:]
+        for byte in 0...255 {
+            if let token = byteEncoder[byte] {
+                vocab[token] = byte
+            }
+        }
+        return vocab
     }
 }
