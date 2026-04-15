@@ -6,6 +6,7 @@ import os
 @MainActor
 final class ModelDownloadManager {
     private static let installMarkerFileName = ".install-complete.json"
+    private static let installMarkerDateFormatter = ISO8601DateFormatter()
 
     var llmState: ModelDownloadState = .notDownloaded
     var embeddingState: ModelDownloadState = .notDownloaded
@@ -792,10 +793,7 @@ final class ModelDownloadManager {
 
         do {
             try validateInstall(modelDir: dir, source: source)
-            if source.isAvailableForDownload && !hasInstallMarker(in: dir) {
-                try writeInstallMarker(for: source, in: dir)
-                logger.info("Backfilled install marker for validated model \(source.id)")
-            }
+            try backfillInstallMarkerIfNeeded(for: source, at: dir, context: "refresh")
             let hasTok = hasTokenizer(for: source.id)
             updateState(for: source.id, state: hasTok ? .installed : .installedMissingTokenizer)
         } catch {
@@ -817,10 +815,7 @@ final class ModelDownloadManager {
             if let src = ModelSourceCatalog.source(for: sourceID) {
                 do {
                     try validateInstall(modelDir: dir, source: src)
-                    if source.isAvailableForDownload, !hasInstallMarker(in: dir) {
-                        try writeInstallMarker(for: src, in: dir)
-                        logger.info("Backfilled install marker during state check for \(sourceID)")
-                    }
+                    try backfillInstallMarkerIfNeeded(for: src, at: dir, context: "state-check")
                     let hasTok = hasTokenizer(for: sourceID)
                     return hasTok ? .installed : .installedMissingTokenizer
                 } catch {
@@ -899,10 +894,16 @@ final class ModelDownloadManager {
         let markerURL = modelDir.appendingPathComponent(Self.installMarkerFileName)
         let payload: [String: String] = [
             "sourceID": source.id,
-            "completedAt": ISO8601DateFormatter().string(from: Date()),
+            "completedAt": Self.installMarkerDateFormatter.string(from: Date()),
         ]
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: markerURL, options: .atomic)
+    }
+
+    private func backfillInstallMarkerIfNeeded(for source: ModelSource, at modelDir: URL, context: String) throws {
+        guard source.isAvailableForDownload, !hasInstallMarker(in: modelDir) else { return }
+        try writeInstallMarker(for: source, in: modelDir)
+        logger.info("Backfilled install marker (\(context)) for \(source.id)")
     }
 
     private func excludeFromBackup(_ url: URL) throws {
