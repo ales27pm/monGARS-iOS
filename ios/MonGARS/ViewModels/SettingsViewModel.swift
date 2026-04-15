@@ -76,4 +76,8 @@ final class SettingsViewModel {
     func requestVoicePermissions() async {
         await permissionsManager.requestAllVoicePermissions()
     }
+
+    func requestAllNativeFeaturePermissions() async {
+        await permissionsManager.requestAllNativeFeaturePermissions()
+    }
 }

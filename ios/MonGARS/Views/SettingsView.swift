@@ -9,6 +9,7 @@ struct SettingsView: View {
             chatModelSection
             embeddingSection
             networkSection
+            nativePermissionsSection
             voiceSection
             privacySection
             aboutSection
@@ -315,6 +316,51 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Native Permissions
+
+    private var nativePermissionsSection: some View {
+        Section {
+            permissionStatusRow(
+                title: viewModel.localeManager.localizedString("Location", "Localisation"),
+                granted: viewModel.permissionsManager.locationAuthorized
+            )
+            permissionStatusRow(
+                title: viewModel.localeManager.localizedString("Contacts", "Contacts"),
+                granted: viewModel.permissionsManager.contactsGranted
+            )
+            permissionStatusRow(
+                title: viewModel.localeManager.localizedString("Calendar", "Calendrier"),
+                granted: viewModel.permissionsManager.calendarGranted
+            )
+            permissionStatusRow(
+                title: viewModel.localeManager.localizedString("Reminders", "Rappels"),
+                granted: viewModel.permissionsManager.remindersGranted
+            )
+            permissionStatusRow(
+                title: viewModel.localeManager.localizedString("Notifications", "Notifications"),
+                granted: viewModel.permissionsManager.notificationsGranted
+            )
+
+            if !allNativePermissionsGranted {
+                Button {
+                    Task { await viewModel.requestAllNativeFeaturePermissions() }
+                } label: {
+                    Label(
+                        viewModel.localeManager.localizedString("Grant All Native Permissions", "Accorder toutes les permissions natives"),
+                        systemImage: "checkmark.shield"
+                    )
+                }
+            }
+        } header: {
+            Text(viewModel.localeManager.localizedString("Native Features", "Fonctionnalités natives"))
+        } footer: {
+            Text(viewModel.localeManager.localizedString(
+                "Grant access to all built-in tools used by MonGARS (location, contacts, calendar, reminders, notifications, and voice).",
+                "Accorde l'accès à tous les outils natifs utilisés par MonGARS (localisation, contacts, calendrier, rappels, notifications et voix)."
+            ))
+        }
+    }
+
     // MARK: - Privacy
 
     private var privacySection: some View {
@@ -415,6 +461,26 @@ struct SettingsView: View {
         case .error:
             Image(systemName: "exclamationmark.triangle")
                 .foregroundStyle(.red)
+        }
+    }
+
+    private var allNativePermissionsGranted: Bool {
+        viewModel.permissionsManager.locationAuthorized &&
+        viewModel.permissionsManager.contactsGranted &&
+        viewModel.permissionsManager.calendarGranted &&
+        viewModel.permissionsManager.remindersGranted &&
+        viewModel.permissionsManager.notificationsGranted &&
+        viewModel.permissionsManager.canUseVoice
+    }
+
+    private func permissionStatusRow(title: String, granted: Bool) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(granted
+                 ? viewModel.localeManager.localizedString("Granted", "Accordé")
+                 : viewModel.localeManager.localizedString("Not Granted", "Non accordé"))
+                .foregroundStyle(granted ? .green : .secondary)
         }
     }
 }

@@ -15,8 +15,10 @@ final class PermissionsManager {
     var remindersGranted: Bool = false
     var locationAuthorized: Bool = false
     var notificationsGranted: Bool = false
+    private let locationManager = CLLocationManager()
 
     init() {
+        locationManager.delegate = self
         checkCurrentStatus()
     }
 
@@ -74,6 +76,20 @@ final class PermissionsManager {
         }
     }
 
+    func requestLocationAccess() {
+        locationManager.requestWhenInUseAuthorization()
+    }
+
+    func requestAllNativeFeaturePermissions() async {
+        requestLocationAccess()
+        await requestNotificationAccess()
+        await requestContactsAccess()
+        await requestCalendarAccess()
+        await requestRemindersAccess()
+        await requestAllVoicePermissions()
+        checkCurrentStatus()
+    }
+
     func requestAllVoicePermissions() async {
         await requestMicrophoneAccess()
         await requestSpeechRecognition()
@@ -94,12 +110,22 @@ final class PermissionsManager {
         calendarGranted = EKEventStore.authorizationStatus(for: .event) == .fullAccess
         remindersGranted = EKEventStore.authorizationStatus(for: .reminder) == .fullAccess
 
-        let locStatus = CLLocationManager().authorizationStatus
+        let locStatus = locationManager.authorizationStatus
         locationAuthorized = locStatus == .authorizedWhenInUse || locStatus == .authorizedAlways
 
         Task {
             let settings = await UNUserNotificationCenter.current().notificationSettings()
             notificationsGranted = settings.authorizationStatus == .authorized
+        }
+    }
+}
+
+extension PermissionsManager: @preconcurrency CLLocationManagerDelegate {
+    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let status = manager.authorizationStatus
+            self.locationAuthorized = status == .authorizedWhenInUse || status == .authorizedAlways
         }
     }
 }

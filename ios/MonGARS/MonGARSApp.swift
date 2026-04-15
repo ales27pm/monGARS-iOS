@@ -12,6 +12,7 @@ struct MonGARSApp: App {
     @State private var toolsRegistered = false
 
     init() {
+        AppStoragePaths.preparePersistentDirectories()
         var manager = ModelDownloadManager()
         if let storedID = SecureStoreService.syncLoad(key: .selectedModelVariant) {
             if ModelSourceCatalog.chatSource(for: storedID) != nil {

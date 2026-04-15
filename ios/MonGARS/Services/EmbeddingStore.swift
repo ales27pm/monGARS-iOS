@@ -9,8 +9,8 @@ actor EmbeddingStore {
     private let dbPath: URL
 
     init() {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        self.dbPath = docs.appendingPathComponent("embeddings.sqlite3")
+        AppStoragePaths.preparePersistentDirectories()
+        self.dbPath = AppStoragePaths.embeddingsDatabaseURL
     }
 
     func open() throws {

@@ -23,6 +23,7 @@ final class ModelDownloadManager {
     private let fileManager = FileManager.default
 
     init() {
+        AppStoragePaths.preparePersistentDirectories()
         checkExistingModels()
     }
 
@@ -133,7 +134,7 @@ final class ModelDownloadManager {
     }
 
     func modelsBaseDirectory() -> URL {
-        URL.documentsDirectory.appending(path: "models", directoryHint: .isDirectory)
+        AppStoragePaths.modelsDirectory
     }
 
     func modelDirectory(for sourceID: ModelSourceID) -> URL {
@@ -163,7 +164,7 @@ final class ModelDownloadManager {
     }
 
     var availableDiskSpaceBytes: Int64 {
-        let path = URL.documentsDirectory
+        let path = AppStoragePaths.appRootDirectory
         guard let values = try? path.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
               let available = values.volumeAvailableCapacityForImportantUsage else {
             return 0
