@@ -23,6 +23,103 @@ actor LLMEngine {
         let requiresStateReset: Bool
     }
 
+    struct BoundedTokenHistory: Sendable, Equatable, RandomAccessCollection {
+        private let capacity: Int
+        private var storage: [Int]
+        private var head: Int = 0
+        private(set) var count: Int = 0
+
+        init(capacity: Int, initialTokens: [Int] = []) {
+            let safeCapacity = Swift.max(capacity, 1)
+            self.capacity = safeCapacity
+            self.storage = Array(repeating: 0, count: safeCapacity)
+
+            if !initialTokens.isEmpty {
+                let start = Swift.max(0, initialTokens.count - safeCapacity)
+                for token in initialTokens[start...] {
+                    _ = append(token)
+                }
+            }
+        }
+
+        var isEmpty: Bool { count == 0 }
+
+        mutating func append(_ token: Int) -> Bool {
+            if count < capacity {
+                let tailIndex = physicalIndex(forLogicalOffset: count)
+                storage[tailIndex] = token
+                count += 1
+                return false
+            }
+
+            storage[head] = token
+            head = (head + 1) % capacity
+            return true
+        }
+
+        func asArray() -> [Int] {
+            guard count > 0 else { return [] }
+            var result: [Int] = []
+            result.reserveCapacity(count)
+            forEach { result.append($0) }
+            return result
+        }
+
+        func suffixArray(_ length: Int) -> [Int] {
+            guard count > 0, length > 0 else { return [] }
+            let take = Swift.min(length, count)
+            var result: [Int] = []
+            result.reserveCapacity(take)
+            forEachSuffix(take) { result.append($0) }
+            return result
+        }
+
+        func uniqueTokensInRecentWindow(windowSize: Int) -> Set<Int> {
+            guard count > 0, windowSize > 0 else { return [] }
+            let take = Swift.min(windowSize, count)
+            var unique = Set<Int>()
+            unique.reserveCapacity(take)
+            forEachSuffix(take) { unique.insert($0) }
+            return unique
+        }
+
+        func forEach(_ body: (Int) -> Void) {
+            guard count > 0 else { return }
+            for logicalIndex in 0..<count {
+                body(storage[physicalIndex(forLogicalOffset: logicalIndex)])
+            }
+        }
+
+        func forEachSuffix(_ suffixCount: Int, body: (Int) -> Void) {
+            guard count > 0 else { return }
+            let take = Swift.min(Swift.max(0, suffixCount), count)
+            let start = count - take
+            for logicalIndex in start..<count {
+                body(storage[physicalIndex(forLogicalOffset: logicalIndex)])
+            }
+        }
+
+        var startIndex: Int { 0 }
+        var endIndex: Int { count }
+
+        func index(after i: Int) -> Int {
+            i + 1
+        }
+
+        func index(before i: Int) -> Int {
+            i - 1
+        }
+
+        subscript(position: Int) -> Int {
+            precondition(position >= 0 && position < count, "BoundedTokenHistory index out of range")
+            return storage[physicalIndex(forLogicalOffset: position)]
+        }
+
+        private func physicalIndex(forLogicalOffset logicalOffset: Int) -> Int {
+            (head + logicalOffset) % capacity
+        }
+    }
+
     private let logger = Logger(subsystem: "com.mongars.ai", category: "llm")
     private let diagnostics: InferenceDiagnostics
 
@@ -42,6 +139,8 @@ actor LLMEngine {
     var isReady: Bool { engineState == .ready }
     var loadedSourceID: ModelSourceID? { currentSourceID }
 
+    nonisolated static let repetitionPenaltyRecentWindow = 64
+
     static func isStatefulModel(stateDescriptionNames: some Collection<String>) -> Bool {
         !stateDescriptionNames.isEmpty
     }
@@ -50,19 +149,31 @@ actor LLMEngine {
         isStateful
     }
 
+    static func predictionHistoryCapacity(contextWindow: Int) -> Int {
+        let safeWindow = Swift.max(contextWindow, 1)
+        return Swift.max(safeWindow - 1, 1)
+    }
+
     static func makeContextWindowPlan(tokens: [Int], contextWindow: Int, isStateful: Bool) -> ContextWindowPlan {
         guard !tokens.isEmpty else {
             return ContextWindowPlan(tokensForPrediction: [], didTruncate: false, requiresStateReset: false)
         }
 
-        let safeWindow = max(contextWindow, 1)
-        let maxTokensForPrediction = max(safeWindow - 1, 1)
+        let maxTokensForPrediction = predictionHistoryCapacity(contextWindow: contextWindow)
         guard tokens.count > maxTokensForPrediction else {
             return ContextWindowPlan(tokensForPrediction: tokens, didTruncate: false, requiresStateReset: false)
         }
 
         let truncated = Array(tokens.suffix(maxTokensForPrediction))
         return ContextWindowPlan(tokensForPrediction: truncated, didTruncate: true, requiresStateReset: isStateful)
+    }
+
+    static func uniqueRecentTokensForRepetitionPenalty(
+        tokens: some Collection<Int>,
+        windowSize: Int = repetitionPenaltyRecentWindow
+    ) -> Set<Int> {
+        guard !tokens.isEmpty, windowSize > 0 else { return [] }
+        return Set(tokens.suffix(windowSize))
     }
 
     func loadModel(sourceID: ModelSourceID, modelURL: URL, tokenizerDirectory: URL, contextWindow: Int) async throws {
@@ -162,9 +273,10 @@ actor LLMEngine {
 
         let genStart = CFAbsoluteTimeGetCurrent()
         let inputTokens = await tokenizer.encode(prompt)
-        var generatedTokens = inputTokens
         let eosToken = await tokenizer.eosTokenId
-        let contextWindow = currentContextWindow
+        let historyCapacity = Self.predictionHistoryCapacity(contextWindow: currentContextWindow)
+        var tokenHistory = BoundedTokenHistory(capacity: historyCapacity, initialTokens: inputTokens)
+        var didEvictSinceLastPrediction = inputTokens.count > historyCapacity
 
         var mergedStopTokens = config.stopTokenIds
         mergedStopTokens.insert(eosToken)
@@ -179,19 +291,21 @@ actor LLMEngine {
                 break
             }
 
-            let stepPlan = Self.makeContextWindowPlan(tokens: generatedTokens, contextWindow: contextWindow, isStateful: isStateful)
-            if stepPlan.didTruncate {
-                generatedTokens = stepPlan.tokensForPrediction
-                if stepPlan.requiresStateReset {
-                    resetKVCache()
-                }
+            if didEvictSinceLastPrediction && isStateful {
+                resetKVCache()
             }
+            didEvictSinceLastPrediction = false
 
-            let logits = try await predictNextTokenLogits(tokens: generatedTokens)
+            let logits = try await predictNextTokenLogits(tokens: tokenHistory)
             var processedLogits = logits
 
             if config.repetitionPenalty > 1.0 {
-                applyRepetitionPenalty(&processedLogits, tokens: generatedTokens, penalty: config.repetitionPenalty)
+                let uniqueRecentTokens = tokenHistory.uniqueTokensInRecentWindow(windowSize: Self.repetitionPenaltyRecentWindow)
+                applyRepetitionPenalty(
+                    &processedLogits,
+                    uniqueRecentTokens: uniqueRecentTokens,
+                    penalty: config.repetitionPenalty
+                )
             }
             if config.frequencyPenalty > 0 {
                 applyFrequencyPenalty(&processedLogits, frequencies: tokenFrequencies, penalty: config.frequencyPenalty)
@@ -204,13 +318,13 @@ actor LLMEngine {
                 break
             }
 
-            generatedTokens.append(nextToken)
+            didEvictSinceLastPrediction = tokenHistory.append(nextToken)
             tokenFrequencies[nextToken, default: 0] += 1
             newTokenCount += 1
         }
 
         let genDuration = CFAbsoluteTimeGetCurrent() - genStart
-        let outputTokens = Array(generatedTokens.suffix(newTokenCount))
+        let outputTokens = tokenHistory.suffixArray(newTokenCount)
         let text = await tokenizer.decode(outputTokens)
 
         let sourceID = currentSourceID ?? "unknown"
@@ -280,9 +394,10 @@ actor LLMEngine {
         let genStart = CFAbsoluteTimeGetCurrent()
 
         let inputTokens = await tokenizer.encode(prompt)
-        var generatedTokens = inputTokens
         let eosToken = await tokenizer.eosTokenId
-        let contextWindow = currentContextWindow
+        let historyCapacity = Self.predictionHistoryCapacity(contextWindow: currentContextWindow)
+        var tokenHistory = BoundedTokenHistory(capacity: historyCapacity, initialTokens: inputTokens)
+        var didEvictSinceLastPrediction = inputTokens.count > historyCapacity
 
         var mergedStopTokens = config.stopTokenIds
         mergedStopTokens.insert(eosToken)
@@ -290,6 +405,7 @@ actor LLMEngine {
         var tokenFrequencies: [Int: Int] = [:]
         var newTokenCount = 0
         var finishReason: GenerationResult.FinishReason = .maxTokens
+        var singleTokenDecodeBuffer = [0]
 
         do {
             for _ in 0..<config.maxNewTokens {
@@ -298,19 +414,21 @@ actor LLMEngine {
                     break
                 }
 
-                let stepPlan = Self.makeContextWindowPlan(tokens: generatedTokens, contextWindow: contextWindow, isStateful: isStateful)
-                if stepPlan.didTruncate {
-                    generatedTokens = stepPlan.tokensForPrediction
-                    if stepPlan.requiresStateReset {
-                        resetKVCache()
-                    }
+                if didEvictSinceLastPrediction && isStateful {
+                    resetKVCache()
                 }
+                didEvictSinceLastPrediction = false
 
-                let logits = try await predictNextTokenLogits(tokens: generatedTokens)
+                let logits = try await predictNextTokenLogits(tokens: tokenHistory)
                 var processedLogits = logits
 
                 if config.repetitionPenalty > 1.0 {
-                    applyRepetitionPenalty(&processedLogits, tokens: generatedTokens, penalty: config.repetitionPenalty)
+                    let uniqueRecentTokens = tokenHistory.uniqueTokensInRecentWindow(windowSize: Self.repetitionPenaltyRecentWindow)
+                    applyRepetitionPenalty(
+                        &processedLogits,
+                        uniqueRecentTokens: uniqueRecentTokens,
+                        penalty: config.repetitionPenalty
+                    )
                 }
                 if config.frequencyPenalty > 0 {
                     applyFrequencyPenalty(&processedLogits, frequencies: tokenFrequencies, penalty: config.frequencyPenalty)
@@ -323,11 +441,12 @@ actor LLMEngine {
                     break
                 }
 
-                generatedTokens.append(nextToken)
+                didEvictSinceLastPrediction = tokenHistory.append(nextToken)
                 tokenFrequencies[nextToken, default: 0] += 1
                 newTokenCount += 1
 
-                let decoded = await tokenizer.decode([nextToken])
+                singleTokenDecodeBuffer[0] = nextToken
+                let decoded = await tokenizer.decode(singleTokenDecodeBuffer)
                 if !decoded.isEmpty {
                     continuation.yield(decoded)
                 }
@@ -356,17 +475,17 @@ actor LLMEngine {
         engineState = .ready
     }
 
-    private func predictNextTokenLogits(tokens: [Int]) async throws -> [Float] {
+    private func predictNextTokenLogits(tokens: some Collection<Int>) async throws -> [Float] {
         guard let model else { throw LLMError.modelNotLoaded }
 
-        let maxLength = max(currentContextWindow, 1)
-        let inputLength = min(tokens.count, maxLength)
+        let maxLength = Swift.max(currentContextWindow, 1)
+        let inputLength = Swift.min(tokens.count, maxLength)
         guard inputLength > 0 else { throw LLMError.contextOverflow }
-        let truncatedTokens = Array(tokens.suffix(inputLength))
-
         let inputArray = try MLMultiArray(shape: [1, NSNumber(value: inputLength)], dataType: .int32)
-        for (i, token) in truncatedTokens.enumerated() {
+        var i = 0
+        for token in tokens.suffix(inputLength) {
             inputArray[[0, NSNumber(value: i)] as [NSNumber]] = NSNumber(value: token)
+            i += 1
         }
 
         let inputFeatures = try MLDictionaryFeatureProvider(dictionary: [
@@ -535,9 +654,12 @@ actor LLMEngine {
         return (filteredIndices, filteredValues)
     }
 
-    private func applyRepetitionPenalty(_ logits: inout [Float], tokens: [Int], penalty: Float) {
-        let uniqueRecent = Set(tokens.suffix(64))
-        for token in uniqueRecent where token < logits.count {
+    private func applyRepetitionPenalty(
+        _ logits: inout [Float],
+        uniqueRecentTokens: Set<Int>,
+        penalty: Float
+    ) {
+        for token in uniqueRecentTokens where token < logits.count {
             if logits[token] > 0 {
                 logits[token] /= penalty
             } else {

@@ -8,6 +8,27 @@ import UserNotifications
 @Observable
 @MainActor
 final class PermissionsManager: NSObject {
+    enum VoiceAuthorizationState: Sendable, Equatable {
+        case notDetermined
+        case granted
+        case denied
+        case restricted
+
+        var isGranted: Bool {
+            self == .granted
+        }
+
+        var isDeniedOrRestricted: Bool {
+            self == .denied || self == .restricted
+        }
+    }
+
+    enum RefreshTrigger: Sendable, Equatable {
+        case initial
+        case manual
+        case appDidBecomeActive
+    }
+
     struct NativePermissionStatus: Identifiable, Sendable {
         let feature: NativeFeature
         let granted: Bool
@@ -25,6 +46,9 @@ final class PermissionsManager: NSObject {
 
     var microphoneGranted: Bool = false
     var speechRecognitionGranted: Bool = false
+    private(set) var microphoneAuthorizationState: VoiceAuthorizationState = .notDetermined
+    private(set) var speechRecognitionAuthorizationState: VoiceAuthorizationState = .notDetermined
+    private(set) var lastRefreshTrigger: RefreshTrigger = .initial
     var contactsGranted: Bool = false
     var calendarGranted: Bool = false
     var remindersGranted: Bool = false
@@ -36,21 +60,39 @@ final class PermissionsManager: NSObject {
     override init() {
         super.init()
         locationManager.delegate = self
-        checkCurrentStatus()
+        refreshAll(trigger: .initial)
     }
 
     func requestMicrophoneAccess() async {
+        let current = currentMicrophoneAuthorizationState()
+        microphoneAuthorizationState = current
+        microphoneGranted = current.isGranted
+
+        guard current == .notDetermined else {
+            return
+        }
+
         let granted = await AVAudioApplication.requestRecordPermission()
-        microphoneGranted = granted
+        microphoneAuthorizationState = granted ? .granted : currentMicrophoneAuthorizationState()
+        microphoneGranted = microphoneAuthorizationState.isGranted
     }
 
     func requestSpeechRecognition() async {
+        let current = Self.voiceAuthorizationState(forSpeechAuthorizationStatus: SFSpeechRecognizer.authorizationStatus())
+        speechRecognitionAuthorizationState = current
+        speechRecognitionGranted = current.isGranted
+
+        guard current == .notDetermined else {
+            return
+        }
+
         let status = await withCheckedContinuation { continuation in
             SFSpeechRecognizer.requestAuthorization { status in
                 continuation.resume(returning: status)
             }
         }
-        speechRecognitionGranted = status == .authorized
+        speechRecognitionAuthorizationState = Self.voiceAuthorizationState(forSpeechAuthorizationStatus: status)
+        speechRecognitionGranted = speechRecognitionAuthorizationState.isGranted
     }
 
     func requestContactsAccess() async {
@@ -123,10 +165,18 @@ final class PermissionsManager: NSObject {
     func requestAllVoicePermissions() async {
         await requestMicrophoneAccess()
         await requestSpeechRecognition()
+        refreshAll()
     }
 
     var canUseVoice: Bool {
         microphoneGranted && speechRecognitionGranted
+    }
+
+    var voicePermissionsDenied: Bool {
+        Self.shouldOfferVoiceSettingsRecovery(
+            microphoneState: microphoneAuthorizationState,
+            speechState: speechRecognitionAuthorizationState
+        )
     }
 
     var nativePermissionStatuses: [NativePermissionStatus] {
@@ -140,12 +190,27 @@ final class PermissionsManager: NSObject {
     }
 
     func refreshAll() {
+        refreshAll(trigger: .manual)
+    }
+
+    /// Refreshes permission state after the app returns to foreground so Settings reflects current system authorization.
+    func refreshAfterAppBecomesActive() {
+        refreshAll(trigger: .appDidBecomeActive)
+    }
+
+    private func refreshAll(trigger: RefreshTrigger) {
+        lastRefreshTrigger = trigger
         checkCurrentStatus()
     }
 
     private func checkCurrentStatus() {
-        microphoneGranted = AVAudioApplication.shared.recordPermission == .granted
-        speechRecognitionGranted = SFSpeechRecognizer.authorizationStatus() == .authorized
+        let micState = currentMicrophoneAuthorizationState()
+        microphoneAuthorizationState = micState
+        microphoneGranted = micState.isGranted
+
+        let speechState = Self.voiceAuthorizationState(forSpeechAuthorizationStatus: SFSpeechRecognizer.authorizationStatus())
+        speechRecognitionAuthorizationState = speechState
+        speechRecognitionGranted = speechState.isGranted
         contactsGranted = CNContactStore.authorizationStatus(for: .contacts) == .authorized
         calendarGranted = EKEventStore.authorizationStatus(for: .event) == .fullAccess
         remindersGranted = EKEventStore.authorizationStatus(for: .reminder) == .fullAccess
@@ -153,9 +218,72 @@ final class PermissionsManager: NSObject {
         let locStatus = locationManager.authorizationStatus
         locationAuthorized = locStatus == .authorizedWhenInUse || locStatus == .authorizedAlways
 
-        Task {
+        Task { @MainActor in
             let settings = await UNUserNotificationCenter.current().notificationSettings()
             notificationsGranted = settings.authorizationStatus == .authorized
+        }
+    }
+
+    private func currentMicrophoneAuthorizationState() -> VoiceAuthorizationState {
+        switch AVAudioApplication.shared.recordPermission {
+        case .granted:
+            return .granted
+        case .denied:
+            return .denied
+        case .undetermined:
+            return .notDetermined
+        @unknown default:
+            return .denied
+        }
+    }
+
+    /// Maps `SFSpeechRecognizerAuthorizationStatus` to the app's normalized voice permission state.
+    nonisolated static func voiceAuthorizationState(forSpeechAuthorizationStatus status: SFSpeechRecognizerAuthorizationStatus) -> VoiceAuthorizationState {
+        switch status {
+        case .authorized:
+            return .granted
+        case .denied:
+            return .denied
+        case .restricted:
+            return .restricted
+        case .notDetermined:
+            return .notDetermined
+        @unknown default:
+            return .denied
+        }
+    }
+
+    /// Maps microphone record permission to the app's normalized voice permission state.
+    nonisolated static func voiceAuthorizationState(forMicrophonePermission permission: AVAudioSession.RecordPermission) -> VoiceAuthorizationState {
+        switch permission {
+        case .granted:
+            return .granted
+        case .denied:
+            return .denied
+        case .undetermined:
+            return .notDetermined
+        @unknown default:
+            return .denied
+        }
+    }
+
+    /// Returns `true` when denied/restricted voice permissions require user recovery through iOS Settings.
+    nonisolated static func shouldOfferVoiceSettingsRecovery(
+        microphoneState: VoiceAuthorizationState,
+        speechState: VoiceAuthorizationState
+    ) -> Bool {
+        switch microphoneState {
+        case .denied, .restricted:
+            return true
+        case .notDetermined, .granted:
+            break
+        }
+
+        switch speechState {
+        case .denied, .restricted:
+            return true
+        case .notDetermined, .granted:
+            return false
         }
     }
 

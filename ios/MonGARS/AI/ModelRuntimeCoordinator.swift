@@ -26,6 +26,12 @@ final class ModelRuntimeCoordinator {
         case runtimeLoadFailed(LLMRuntimeFailureCategory)
     }
 
+    nonisolated struct LLMAvailabilityGuidance: Sendable, Equatable {
+        let englishMessage: String
+        let frenchMessage: String
+        let recoveryActions: [ModelRecoveryAction]
+    }
+
     let llmEngine: LLMEngine
     let embeddingEngine: EmbeddingEngine
     let diagnostics: InferenceDiagnostics
@@ -319,6 +325,53 @@ final class ModelRuntimeCoordinator {
 
     var isFullyOperational: Bool {
         llmReady
+    }
+
+    /// Maps an availability issue to localized end-user guidance and actionable recovery steps.
+    nonisolated static func guidance(for issue: LLMAvailabilityIssue?) -> LLMAvailabilityGuidance? {
+        switch issue {
+        case .notInstalled:
+            return LLMAvailabilityGuidance(
+                englishMessage: "The chat model is not installed. Open Settings > Chat Model and download a model.",
+                frenchMessage: "Le modèle de conversation n'est pas installé. Ouvrez Réglages > Modèle de conversation et téléchargez un modèle.",
+                recoveryActions: [.openModelSettings, .retryDownload]
+            )
+        case .tokenizerMissing:
+            return LLMAvailabilityGuidance(
+                englishMessage: "Tokenizer files are missing for the selected model. Reinstall that model from Settings.",
+                frenchMessage: "Les fichiers tokenizer sont manquants pour le modèle sélectionné. Réinstallez ce modèle depuis les Réglages.",
+                recoveryActions: [.reinstallModel, .openModelSettings]
+            )
+        case .runtimeLoadFailed(let category):
+            switch category {
+            case .modelFilesMissing:
+                return LLMAvailabilityGuidance(
+                    englishMessage: "Required model files are missing or invalid. Reinstall the selected model from Settings.",
+                    frenchMessage: "Des fichiers requis du modèle sont manquants ou invalides. Réinstallez le modèle sélectionné depuis les Réglages.",
+                    recoveryActions: [.reinstallModel, .openModelSettings]
+                )
+            case .tokenizerInvalid:
+                return LLMAvailabilityGuidance(
+                    englishMessage: "Tokenizer data is invalid for the selected model. Reinstall the model from Settings.",
+                    frenchMessage: "Les données tokenizer sont invalides pour le modèle sélectionné. Réinstallez le modèle depuis les Réglages.",
+                    recoveryActions: [.reinstallModel, .openModelSettings]
+                )
+            case .outOfMemory:
+                return LLMAvailabilityGuidance(
+                    englishMessage: "The model could not load due to memory pressure. Close other apps, then retry loading from Settings.",
+                    frenchMessage: "Le modèle n'a pas pu se charger en raison de la pression mémoire. Fermez les autres apps, puis réessayez le chargement depuis les Réglages.",
+                    recoveryActions: [.closeOtherApps, .retryRuntimeLoad]
+                )
+            case .initializationFailed:
+                return LLMAvailabilityGuidance(
+                    englishMessage: "The model runtime failed to initialize. Retry model loading from Settings. If it persists, reinstall the model.",
+                    frenchMessage: "Le runtime du modèle n'a pas pu s'initialiser. Réessayez le chargement du modèle depuis les Réglages. Si le problème persiste, réinstallez le modèle.",
+                    recoveryActions: [.retryRuntimeLoad, .reinstallModel, .openModelSettings]
+                )
+            }
+        case .none:
+            return nil
+        }
     }
 
     var llmAvailabilityIssue: LLMAvailabilityIssue? {

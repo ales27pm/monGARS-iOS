@@ -2,6 +2,7 @@ import SwiftUI
 import SwiftData
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @Environment(LocaleManager.self) private var localeManager
     @Environment(ModelDownloadManager.self) private var modelDownloadManager
     @Environment(PermissionsManager.self) private var permissionsManager
@@ -28,46 +29,52 @@ struct ContentView: View {
     }
 
     var body: some View {
-        if !hasCompletedOnboarding {
-            onboardingFlow
-        } else {
-            mainApp
-                .task {
-                    if runtimeCoordinator == nil {
-                        let coordinator = ModelRuntimeCoordinator(modelDownloadManager: modelDownloadManager)
-                        runtimeCoordinator = coordinator
+        Group {
+            if !hasCompletedOnboarding {
+                onboardingFlow
+            } else {
+                mainApp
+                    .task {
+                        if runtimeCoordinator == nil {
+                            let coordinator = ModelRuntimeCoordinator(modelDownloadManager: modelDownloadManager)
+                            runtimeCoordinator = coordinator
 
-                        do {
-                            try await embeddingStore.open()
-                        } catch {
-                            print("EmbeddingStore open failed: \(error)")
+                            do {
+                                try await embeddingStore.open()
+                            } catch {
+                                print("EmbeddingStore open failed: \(error)")
+                            }
+
+                            let memory = SemanticMemoryService(
+                                embeddingStore: embeddingStore,
+                                embeddingEngine: coordinator.embeddingEngine
+                            )
+                            memoryService = memory
+
+                            await coordinator.loadAllAvailable()
                         }
-
-                        let memory = SemanticMemoryService(
-                            embeddingStore: embeddingStore,
-                            embeddingEngine: coordinator.embeddingEngine
-                        )
-                        memoryService = memory
-
-                        await coordinator.loadAllAvailable()
                     }
-                }
-                .onChange(of: modelDownloadManager.llmState) { _, newState in
-                    guard let coordinator = runtimeCoordinator else { return }
-                    coordinator.enqueueLLMTransition(newState)
-                }
-                .onChange(of: modelDownloadManager.embeddingState) { _, newState in
-                    guard let coordinator = runtimeCoordinator else { return }
-                    coordinator.enqueueEmbeddingTransition(newState)
-                }
-                .onChange(of: modelDownloadManager.selectedChatSourceID) { _, _ in
-                    guard let coordinator = runtimeCoordinator else { return }
-                    coordinator.requestChatReloadForSelectionChange()
-                }
-                .onChange(of: modelDownloadManager.selectedEmbeddingSourceID) { _, _ in
-                    guard let coordinator = runtimeCoordinator else { return }
-                    coordinator.requestEmbeddingReloadForSelectionChange()
-                }
+                    .onChange(of: modelDownloadManager.llmState) { _, newState in
+                        guard let coordinator = runtimeCoordinator else { return }
+                        coordinator.enqueueLLMTransition(newState)
+                    }
+                    .onChange(of: modelDownloadManager.embeddingState) { _, newState in
+                        guard let coordinator = runtimeCoordinator else { return }
+                        coordinator.enqueueEmbeddingTransition(newState)
+                    }
+                    .onChange(of: modelDownloadManager.selectedChatSourceID) { _, _ in
+                        guard let coordinator = runtimeCoordinator else { return }
+                        coordinator.requestChatReloadForSelectionChange()
+                    }
+                    .onChange(of: modelDownloadManager.selectedEmbeddingSourceID) { _, _ in
+                        guard let coordinator = runtimeCoordinator else { return }
+                        coordinator.requestEmbeddingReloadForSelectionChange()
+                    }
+            }
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            guard newPhase == .active else { return }
+            permissionsManager.refreshAfterAppBecomesActive()
         }
     }
 
@@ -116,7 +123,8 @@ struct ContentView: View {
                             localeManager: localeManager,
                             modelDownloadManager: modelDownloadManager,
                             permissionsManager: permissionsManager,
-                            networkPolicy: networkPolicy
+                            networkPolicy: networkPolicy,
+                            runtimeCoordinator: runtimeCoordinator
                         )
                     )
                 }

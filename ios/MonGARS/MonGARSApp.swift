@@ -20,17 +20,32 @@ struct MonGARSApp: App {
             logger.error("Failed to prepare app storage folders: \(error.localizedDescription, privacy: .public)")
         }
         let manager = ModelDownloadManager()
-        if let storedID = SecureStoreService.syncLoad(key: .selectedModelVariant) {
-            if ModelSourceCatalog.chatSource(for: storedID) != nil {
-                manager.selectedChatSourceID = storedID
-            } else if let migrated = ModelSourceCatalog.migrateOldVariant(storedID),
-                      ModelSourceCatalog.chatSource(for: migrated) != nil {
-                manager.selectedChatSourceID = migrated
-            }
-        }
-        if let storedEmbedID = SecureStoreService.syncLoad(key: .selectedEmbeddingSource) {
-            if ModelSourceCatalog.embeddingSource(for: storedEmbedID) != nil {
-                manager.selectedEmbeddingSourceID = storedEmbedID
+        let persistedChatSourceID = SecureStoreService.syncLoad(key: .selectedModelVariant)
+        let persistedEmbeddingSourceID = SecureStoreService.syncLoad(key: .selectedEmbeddingSource)
+        let selectionValidation = manager.validateSelectionOnLaunch(
+            persistedChatSourceID: persistedChatSourceID,
+            persistedEmbeddingSourceID: persistedEmbeddingSourceID
+        )
+
+        manager.selectedChatSourceID = selectionValidation.chatSourceID
+        manager.selectedEmbeddingSourceID = selectionValidation.embeddingSourceID
+        manager.refreshSelectedStates()
+
+        if selectionValidation.chatNeedsPersistenceUpdate || selectionValidation.embeddingNeedsPersistenceUpdate {
+            logger.info("Corrected persisted model selection. chat=\(selectionValidation.chatSourceID, privacy: .public), embedding=\(selectionValidation.embeddingSourceID, privacy: .public)")
+            Task {
+                if selectionValidation.chatNeedsPersistenceUpdate {
+                    try? await SecureStoreService.shared.save(
+                        key: .selectedModelVariant,
+                        value: selectionValidation.chatSourceID
+                    )
+                }
+                if selectionValidation.embeddingNeedsPersistenceUpdate {
+                    try? await SecureStoreService.shared.save(
+                        key: .selectedEmbeddingSource,
+                        value: selectionValidation.embeddingSourceID
+                    )
+                }
             }
         }
         _modelDownloadManager = State(initialValue: manager)

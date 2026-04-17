@@ -317,6 +317,99 @@ nonisolated struct ModelSourceCatalog: Sendable {
 
     static var fallbackChatSourceID: ModelSourceID { "llama-3.2-1b" }
 
+    static func migratePersistedChatSourceID(_ persistedID: ModelSourceID?) -> ModelSourceID? {
+        guard let persistedID else { return nil }
+        if chatSource(for: persistedID) != nil {
+            return persistedID
+        }
+        if let migrated = migrateOldVariant(persistedID),
+           chatSource(for: migrated) != nil {
+            return migrated
+        }
+        return nil
+    }
+
+    static func migratePersistedEmbeddingSourceID(_ persistedID: ModelSourceID?) -> ModelSourceID? {
+        guard let persistedID else { return nil }
+        if embeddingSource(for: persistedID) != nil {
+            return persistedID
+        }
+        switch persistedID {
+        case "granite-embedding-278m":
+            return defaultEmbeddingSourceID
+        default:
+            return nil
+        }
+    }
+
+    static func resolveChatSelection(
+        candidate: ModelSourceID?,
+        installedSourceIDs: Set<ModelSourceID>,
+        excluding excludedSourceIDs: Set<ModelSourceID> = []
+    ) -> ModelSourceID {
+        let availableIDs = chatSources
+            .map(\.id)
+            .filter { !excludedSourceIDs.contains($0) }
+        let installedIDs = chatSources
+            .map(\.id)
+            .filter { installedSourceIDs.contains($0) && !excludedSourceIDs.contains($0) }
+
+        if let candidate,
+           installedIDs.contains(candidate) {
+            return candidate
+        }
+
+        if installedIDs.contains(defaultChatSourceID) {
+            return defaultChatSourceID
+        }
+
+        if let firstInstalled = installedIDs.first {
+            return firstInstalled
+        }
+
+        if availableIDs.contains(defaultChatSourceID) {
+            return defaultChatSourceID
+        }
+
+        if availableIDs.contains(fallbackChatSourceID) {
+            return fallbackChatSourceID
+        }
+
+        return availableIDs.first ?? defaultChatSourceID
+    }
+
+    static func resolveEmbeddingSelection(
+        candidate: ModelSourceID?,
+        installedSourceIDs: Set<ModelSourceID>,
+        excluding excludedSourceIDs: Set<ModelSourceID> = []
+    ) -> ModelSourceID {
+        let availableIDs = embeddingSources
+            .map(\.id)
+            .filter { !excludedSourceIDs.contains($0) }
+        let installedIDs = embeddingSources
+            .map(\.id)
+            .filter { installedSourceIDs.contains($0) && !excludedSourceIDs.contains($0) }
+
+        if let candidate,
+           installedIDs.contains(candidate) {
+            return candidate
+        }
+
+        if installedIDs.contains(defaultEmbeddingSourceID) {
+            return defaultEmbeddingSourceID
+        }
+
+        if let firstInstalled = installedIDs.first {
+            return firstInstalled
+        }
+
+        if availableIDs.contains(defaultEmbeddingSourceID) {
+            return defaultEmbeddingSourceID
+        }
+
+        return availableIDs.first ?? defaultEmbeddingSourceID
+    }
+
     static func migrateOldVariant(_ oldRawValue: String) -> ModelSourceID? {
         switch oldRawValue {
         case "llama-3.2-1b-instruct": return "llama-3.2-1b"
@@ -394,6 +487,41 @@ nonisolated enum ModelInstallError: Error, Sendable {
     case mlpackageInvalid(String)
 }
 
+/// Install/download pipeline stage associated with a user-facing model failure report.
+nonisolated enum ModelFailureStage: String, Sendable, Equatable {
+    case preflight
+    case downloading
+    case installing
+    case validating
+    case tokenizer
+    case storage
+    case runtime
+}
+
+/// Recovery actions that can be surfaced in UI for model/runtime failures.
+nonisolated enum ModelRecoveryAction: String, Sendable, Equatable {
+    case retryDownload
+    case checkNetworkConnection
+    case waitAndRetry
+    case acceptModelLicense
+    case freeStorageSpace
+    case reinstallModel
+    case chooseAnotherModel
+    case openModelSettings
+    case closeOtherApps
+    case retryRuntimeLoad
+}
+
+/// Structured failure payload shown to users in Settings diagnostics.
+nonisolated struct ModelFailureReport: Sendable, Equatable {
+    let sourceID: ModelSourceID
+    let stage: ModelFailureStage
+    let message: String
+    let recoveryActions: [ModelRecoveryAction]
+    let timestamp: Date
+}
+
+/// Normalized download diagnostics mapped from HTTP/preflight failures.
 nonisolated enum DownloadDiagnosticError: Error, Sendable {
     case accessDenied(url: String, statusCode: Int)
     case notFound(url: String)
@@ -405,20 +533,39 @@ nonisolated enum DownloadDiagnosticError: Error, Sendable {
 
     var userMessage: String {
         switch self {
-        case .accessDenied(let url, let code):
-            "Access denied (HTTP \(code)). This model may be gated and require authentication or license acceptance on Hugging Face. URL: \(url)"
-        case .notFound(let url):
-            "Model artifact not found (HTTP 404). The file may have been moved or removed. URL: \(url)"
-        case .rateLimited(let url):
-            "Rate limited (HTTP 429). Please wait a few minutes and try again. URL: \(url)"
-        case .serverError(let url, let code):
-            "Server error (HTTP \(code)). The model host is experiencing issues. URL: \(url)"
-        case .unexpectedStatus(let url, let code, let body):
-            "Unexpected response (HTTP \(code)) from \(url). Response: \(body)"
-        case .preflightUnreachable(let url, let error):
-            "Could not reach model host. URL: \(url). Error: \(error)"
+        case .accessDenied(_, let code):
+            "Access denied (HTTP \(code)). This model may require Hugging Face login or license acceptance."
+        case .notFound:
+            "Model files were not found on the host (HTTP 404). The source may have changed."
+        case .rateLimited:
+            "Download rate limit reached (HTTP 429). Wait a few minutes and retry."
+        case .serverError(_, let code):
+            "Model host error (HTTP \(code)). Retry in a few minutes."
+        case .unexpectedStatus(_, let code, _):
+            "Unexpected response from the model host (HTTP \(code)). Retry the download."
+        case .preflightUnreachable:
+            "Could not reach the model host. Check your connection and retry."
         case .noDownloadURL(let sourceID):
-            "No download URL configured for \(sourceID)."
+            "No download URL is configured for \(sourceID). Select another model source."
+        }
+    }
+
+    var recoveryActions: [ModelRecoveryAction] {
+        switch self {
+        case .accessDenied:
+            [.acceptModelLicense, .retryDownload]
+        case .notFound:
+            [.chooseAnotherModel, .retryDownload]
+        case .rateLimited:
+            [.waitAndRetry, .retryDownload]
+        case .serverError:
+            [.waitAndRetry, .retryDownload]
+        case .unexpectedStatus:
+            [.retryDownload, .checkNetworkConnection]
+        case .preflightUnreachable:
+            [.checkNetworkConnection, .retryDownload]
+        case .noDownloadURL:
+            [.chooseAnotherModel, .openModelSettings]
         }
     }
 }
@@ -469,6 +616,7 @@ nonisolated enum DownloadRecoveryAction: Sendable, Equatable {
     case fail
 }
 
+/// Deterministic retry policy for model downloads.
 nonisolated struct DownloadRetryPlanner: Sendable {
     let maxRetriesPerURL: Int
     let baseDelaySeconds: Double
@@ -512,6 +660,7 @@ nonisolated struct DownloadRetryPlanner: Sendable {
     }
 }
 
+/// Chooses the next download URL index from retry planner output.
 nonisolated struct DownloadURLSelector: Sendable {
     static func nextIndex(after action: DownloadRecoveryAction, currentIndex: Int, totalURLCount: Int) -> Int? {
         switch action {

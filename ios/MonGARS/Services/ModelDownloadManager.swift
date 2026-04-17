@@ -2,6 +2,13 @@ import Foundation
 import ZIPFoundation
 import os
 
+nonisolated struct ModelSelectionValidationResult: Sendable, Equatable {
+    let chatSourceID: ModelSourceID
+    let embeddingSourceID: ModelSourceID
+    let chatNeedsPersistenceUpdate: Bool
+    let embeddingNeedsPersistenceUpdate: Bool
+}
+
 @Observable
 @MainActor
 final class ModelDownloadManager {
@@ -64,6 +71,7 @@ final class ModelDownloadManager {
     var overallPhase: OverallInstallPhase?
     var lastDiagnosticMessage: String?
     var lastTokenizerFallbackResult: TokenizerFallbackResult?
+    private(set) var lastFailureBySourceID: [ModelSourceID: ModelFailureReport] = [:]
 
     @ObservationIgnored private var activeTasks: [ModelSourceID: URLSessionDownloadTask] = [:]
     @ObservationIgnored private var taskToSourceID: [Int: ModelSourceID] = [:]
@@ -89,9 +97,22 @@ final class ModelDownloadManager {
         do {
             try AppStoragePaths.preparePersistentDirectories()
         } catch {
-            llmState = .error("Storage initialization failed: \(error.localizedDescription)")
-            embeddingState = .error("Storage initialization failed: \(error.localizedDescription)")
-            lastDiagnosticMessage = "Storage initialization failed: \(error.localizedDescription)"
+            let message = "Storage initialization failed. Free storage space and retry."
+            llmState = .error(message)
+            embeddingState = .error(message)
+            lastDiagnosticMessage = message
+            recordFailure(
+                for: selectedChatSourceID,
+                stage: .storage,
+                message: message,
+                recoveryActions: [.freeStorageSpace, .retryDownload]
+            )
+            recordFailure(
+                for: selectedEmbeddingSourceID,
+                stage: .storage,
+                message: message,
+                recoveryActions: [.freeStorageSpace, .retryDownload]
+            )
             logger.error("Failed to prepare persistent directories: \(error.localizedDescription, privacy: .public)")
             return
         }
@@ -126,11 +147,19 @@ final class ModelDownloadManager {
 
     func startDownload(sourceID: ModelSourceID) {
         guard let source = ModelSourceCatalog.source(for: sourceID) else {
-            updateState(for: sourceID, state: .error("Unknown model source: \(sourceID)"))
+            let message = "Selected model source is invalid. Re-select a model in Settings."
+            updateState(for: sourceID, state: .error(message))
+            recordFailure(
+                for: sourceID,
+                stage: .preflight,
+                message: message,
+                recoveryActions: [.openModelSettings, .chooseAnotherModel]
+            )
             return
         }
 
         cancelledSources.remove(sourceID)
+        clearFailure(for: sourceID)
 
         guard source.isAvailableForDownload else {
             if case .unsupported(let reason) = source.downloadStrategy {
@@ -142,7 +171,14 @@ final class ModelDownloadManager {
         }
 
         guard hasSufficientSpace(for: source) else {
-            updateState(for: sourceID, state: .error("Insufficient disk space. Need \(source.estimatedSizeDescription) free."))
+            let message = "Not enough storage to download this model. Free at least \(source.estimatedSizeDescription) and retry."
+            updateState(for: sourceID, state: .error(message))
+            recordFailure(
+                for: sourceID,
+                stage: .storage,
+                message: message,
+                recoveryActions: [.freeStorageSpace, .retryDownload]
+            )
             return
         }
 
@@ -159,7 +195,14 @@ final class ModelDownloadManager {
             case .archive(let filename):
                 let urls = source.hfResolveURLs(path: filename)
                 guard !urls.isEmpty else {
-                    updateState(for: sourceID, state: .error(DownloadDiagnosticError.noDownloadURL(sourceID: sourceID).userMessage))
+                    let diag = DownloadDiagnosticError.noDownloadURL(sourceID: sourceID)
+                    updateState(for: sourceID, state: .error(diag.userMessage))
+                    recordFailure(
+                        for: sourceID,
+                        stage: .preflight,
+                        message: diag.userMessage,
+                        recoveryActions: diag.recoveryActions
+                    )
                     return
                 }
                 let preflightOK = await preflightCheck(urls: urls, sourceID: sourceID)
@@ -219,15 +262,47 @@ final class ModelDownloadManager {
         currentInstallPhase = nil
         overallPhase = nil
         updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .cancelled))
+        clearFailure(for: sourceID)
     }
 
     func deleteModel(sourceID: ModelSourceID) {
+        let deletedSource = ModelSourceCatalog.source(for: sourceID)
+        let deletingSelectedChat = deletedSource?.isChat == true && selectedChatSourceID == sourceID
+        let deletingSelectedEmbedding = deletedSource?.isEmbedding == true && selectedEmbeddingSourceID == sourceID
+
         cancelDownload(sourceID: sourceID)
         clearResumeData(for: sourceID)
+        clearFailure(for: sourceID)
         let modelDir = modelDirectory(for: sourceID)
         try? fileManager.removeItem(at: modelDir)
         updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .cancelled))
+
+        if deletingSelectedChat {
+            let fallbackChatSourceID = ModelSourceCatalog.resolveChatSelection(
+                candidate: nil,
+                installedSourceIDs: installedChatSourceIDsOnDisk(),
+                excluding: [sourceID]
+            )
+            selectedChatSourceID = fallbackChatSourceID
+        }
+
+        if deletingSelectedEmbedding {
+            let fallbackEmbeddingSourceID = ModelSourceCatalog.resolveEmbeddingSelection(
+                candidate: nil,
+                installedSourceIDs: installedEmbeddingSourceIDsOnDisk(),
+                excluding: [sourceID]
+            )
+            selectedEmbeddingSourceID = fallbackEmbeddingSourceID
+        }
+
+        if deletingSelectedChat || deletingSelectedEmbedding {
+            refreshSelectedStates()
+        }
         logger.info("Model deleted: \(sourceID)")
+    }
+
+    func lastFailureReport(for sourceID: ModelSourceID) -> ModelFailureReport? {
+        lastFailureBySourceID[sourceID]
     }
 
     func modelsBaseDirectory() -> URL {
@@ -278,9 +353,10 @@ final class ModelDownloadManager {
 
     private func preflightCheck(urls: [URL], sourceID: ModelSourceID) async -> Bool {
         guard !urls.isEmpty else {
-            let message = DownloadDiagnosticError.noDownloadURL(sourceID: sourceID).userMessage
+            let diag = DownloadDiagnosticError.noDownloadURL(sourceID: sourceID)
+            let message = diag.userMessage
             updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: message)))
-            lastDiagnosticMessage = message
+            recordFailure(for: sourceID, stage: .preflight, message: message, recoveryActions: diag.recoveryActions)
             return false
         }
 
@@ -297,7 +373,7 @@ final class ModelDownloadManager {
             do {
                 let (_, response) = try await URLSession.shared.data(for: request)
                 guard let http = response as? HTTPURLResponse else {
-                    lastFailureMessage = "Preflight: non-HTTP response"
+                    lastFailureMessage = "Model host returned an invalid response during preflight."
                     continue
                 }
 
@@ -323,7 +399,12 @@ final class ModelDownloadManager {
                 }
 
                 updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: diagError.userMessage)))
-                lastDiagnosticMessage = diagError.userMessage
+                recordFailure(
+                    for: sourceID,
+                    stage: .preflight,
+                    message: diagError.userMessage,
+                    recoveryActions: diagError.recoveryActions
+                )
                 return false
             } catch {
                 let failureKind = downloadFailureKind(from: error)
@@ -345,16 +426,25 @@ final class ModelDownloadManager {
                     return false
                 }
 
-                let message = DownloadDiagnosticError.preflightUnreachable(url: url.absoluteString, underlyingError: error.localizedDescription).userMessage
+                let diag = DownloadDiagnosticError.preflightUnreachable(
+                    url: url.absoluteString,
+                    underlyingError: error.localizedDescription
+                )
+                let message = diag.userMessage
                 updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: message)))
-                lastDiagnosticMessage = message
+                recordFailure(for: sourceID, stage: .preflight, message: message, recoveryActions: diag.recoveryActions)
                 return false
             }
         }
 
         let finalMessage = lastFailureMessage ?? DownloadDiagnosticError.noDownloadURL(sourceID: sourceID).userMessage
         updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: finalMessage)))
-        lastDiagnosticMessage = finalMessage
+        recordFailure(
+            for: sourceID,
+            stage: .preflight,
+            message: finalMessage,
+            recoveryActions: [.retryDownload, .checkNetworkConnection]
+        )
         return false
     }
 
@@ -394,7 +484,8 @@ final class ModelDownloadManager {
         } catch {
             let message = errorMessage(from: error, defaultPrefix: "Download error")
             updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: message)))
-            lastDiagnosticMessage = message
+            let (stage, actions) = classifyFailureContext(for: error, fallbackStage: .downloading)
+            recordFailure(for: sourceID, stage: stage, message: message, recoveryActions: actions)
             currentInstallPhase = nil
             overallPhase = nil
         }
@@ -444,12 +535,16 @@ final class ModelDownloadManager {
 
             currentInstallPhase = .complete
             let hasTokenizer = tokResult.filesDownloaded.contains("tokenizer.json")
+            clearFailure(for: sourceID)
             updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .success(hasTokenizer: hasTokenizer)))
             logger.info("Archive model installed: \(sourceID)")
         } catch {
             try? fileManager.removeItem(at: stagingDir)
             clearResumeData(for: sourceID)
-            updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: "Install failed: \(error.localizedDescription)")))
+            let message = errorMessage(from: error, defaultPrefix: "Install failed")
+            updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: message)))
+            let (stage, actions) = classifyFailureContext(for: error, fallbackStage: .installing)
+            recordFailure(for: sourceID, stage: stage, message: message, recoveryActions: actions)
         }
 
         currentInstallPhase = nil
@@ -462,7 +557,14 @@ final class ModelDownloadManager {
 
         let treeURLs = source.hfTreeURLs(path: modelPath)
         guard !treeURLs.isEmpty else {
-            updateState(for: sourceID, state: .error("Invalid tree URL for \(sourceID)"))
+            let message = "Model source configuration is invalid. Select another model source and retry."
+            updateState(for: sourceID, state: .error(message))
+            recordFailure(
+                for: sourceID,
+                stage: .preflight,
+                message: message,
+                recoveryActions: [.chooseAnotherModel, .openModelSettings]
+            )
             currentInstallPhase = nil
             return
         }
@@ -486,7 +588,14 @@ final class ModelDownloadManager {
 
             let fileEntries = try await listHFDirectory(treeURLs: treeURLs, sourceID: sourceID)
             guard !fileEntries.isEmpty else {
-                updateState(for: sourceID, state: .error("No files found in model directory on HuggingFace"))
+                let message = "Model host did not return required files. Try again later or select another model."
+                updateState(for: sourceID, state: .error(message))
+                recordFailure(
+                    for: sourceID,
+                    stage: .downloading,
+                    message: message,
+                    recoveryActions: [.waitAndRetry, .chooseAnotherModel]
+                )
                 currentInstallPhase = nil
                 return
             }
@@ -558,6 +667,7 @@ final class ModelDownloadManager {
             currentInstallPhase = .complete
             let hasTokenizer = tokResult.filesDownloaded.contains("tokenizer.json")
             clearResumeData(for: sourceID)
+            clearFailure(for: sourceID)
             updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .success(hasTokenizer: hasTokenizer)))
             logger.info("Repo directory model installed: \(sourceID)")
         } catch is CancellationError {
@@ -571,7 +681,8 @@ final class ModelDownloadManager {
             clearResumeData(for: sourceID)
             let message = errorMessage(from: error, defaultPrefix: "Install failed")
             updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: message)))
-            lastDiagnosticMessage = message
+            let (stage, actions) = classifyFailureContext(for: error, fallbackStage: .installing)
+            recordFailure(for: sourceID, stage: stage, message: message, recoveryActions: actions)
             logger.error("Repo directory install failed for \(sourceID): \(message, privacy: .public)")
         }
 
@@ -580,7 +691,14 @@ final class ModelDownloadManager {
 
     private func preflightCheckTree(treeURLs: [URL], sourceID: ModelSourceID) async -> Bool {
         guard !treeURLs.isEmpty else {
-            updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: "Invalid tree URL for \(sourceID)")))
+            let message = "Model source configuration is invalid. Select another model source and retry."
+            updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: message)))
+            recordFailure(
+                for: sourceID,
+                stage: .preflight,
+                message: message,
+                recoveryActions: [.chooseAnotherModel, .openModelSettings]
+            )
             currentInstallPhase = nil
             return false
         }
@@ -599,7 +717,7 @@ final class ModelDownloadManager {
 
                 let (data, response) = try await URLSession.shared.data(for: request)
                 guard let http = response as? HTTPURLResponse else {
-                    lastFailureMessage = "Preflight: non-HTTP response"
+                    lastFailureMessage = "Model host returned an invalid response while checking model files."
                     continue
                 }
 
@@ -609,7 +727,7 @@ final class ModelDownloadManager {
                     if let jsonArray = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]], !jsonArray.isEmpty {
                         return true
                     }
-                    lastFailureMessage = "Artifact directory is empty or invalid at \(finalURL.absoluteString)"
+                    lastFailureMessage = "Model files are missing from the selected source."
                     continue
                 }
 
@@ -629,7 +747,12 @@ final class ModelDownloadManager {
                 }
 
                 updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: diagError.userMessage)))
-                lastDiagnosticMessage = diagError.userMessage
+                recordFailure(
+                    for: sourceID,
+                    stage: .preflight,
+                    message: diagError.userMessage,
+                    recoveryActions: diagError.recoveryActions
+                )
                 currentInstallPhase = nil
                 return false
             } catch {
@@ -652,17 +775,26 @@ final class ModelDownloadManager {
                     return false
                 }
 
-                let message = DownloadDiagnosticError.preflightUnreachable(url: recursiveURL.absoluteString, underlyingError: error.localizedDescription).userMessage
+                let diag = DownloadDiagnosticError.preflightUnreachable(
+                    url: recursiveURL.absoluteString,
+                    underlyingError: error.localizedDescription
+                )
+                let message = diag.userMessage
                 updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: message)))
-                lastDiagnosticMessage = message
+                recordFailure(for: sourceID, stage: .preflight, message: message, recoveryActions: diag.recoveryActions)
                 currentInstallPhase = nil
                 return false
             }
         }
 
-        let finalMessage = lastFailureMessage ?? "Artifact directory is empty or invalid"
+        let finalMessage = lastFailureMessage ?? "Model files are missing from the selected source."
         updateState(for: sourceID, state: ModelDownloadStateReducer.reduce(stateForSource(sourceID), event: .fail(message: finalMessage)))
-        lastDiagnosticMessage = finalMessage
+        recordFailure(
+            for: sourceID,
+            stage: .preflight,
+            message: finalMessage,
+            recoveryActions: [.chooseAnotherModel, .retryDownload]
+        )
         currentInstallPhase = nil
         return false
     }
@@ -687,7 +819,7 @@ final class ModelDownloadManager {
             do {
                 let (data, response) = try await URLSession.shared.data(from: recursiveURL)
                 guard let http = response as? HTTPURLResponse else {
-                    throw ModelInstallError.hfTreeListFailed("Non-HTTP response from \(recursiveURL.absoluteString)")
+                    throw ModelInstallError.hfTreeListFailed("Model host returned an invalid response while listing files.")
                 }
 
                 if (200...299).contains(http.statusCode) {
@@ -741,7 +873,7 @@ final class ModelDownloadManager {
                 let failureKind = downloadFailureKind(from: error)
                 let hasFallback = currentIndex + 1 < treeURLs.count
                 let action = retryPlanner.nextAction(for: failureKind, retryCountOnCurrentURL: retryCount, hasFallbackURL: hasFallback)
-                lastFailureMessage = "HF directory list failed at \(recursiveURL.absoluteString): \(error.localizedDescription)"
+                lastFailureMessage = "Unable to list model files from the host. Check your network and retry."
 
                 switch action {
                 case .retry(let delay):
@@ -1009,6 +1141,38 @@ final class ModelDownloadManager {
 
     // MARK: - State Management
 
+    func validateSelectionOnLaunch(
+        persistedChatSourceID: ModelSourceID?,
+        persistedEmbeddingSourceID: ModelSourceID?,
+        installedChatSourceIDs: Set<ModelSourceID>? = nil,
+        installedEmbeddingSourceIDs: Set<ModelSourceID>? = nil
+    ) -> ModelSelectionValidationResult {
+        let migratedChatSourceID = ModelSourceCatalog.migratePersistedChatSourceID(persistedChatSourceID)
+        let migratedEmbeddingSourceID = ModelSourceCatalog.migratePersistedEmbeddingSourceID(persistedEmbeddingSourceID)
+
+        let chatInstalledIDs = installedChatSourceIDs ?? installedChatSourceIDsOnDisk()
+        let embeddingInstalledIDs = installedEmbeddingSourceIDs ?? installedEmbeddingSourceIDsOnDisk()
+
+        let resolvedChatSourceID = ModelSourceCatalog.resolveChatSelection(
+            candidate: migratedChatSourceID,
+            installedSourceIDs: chatInstalledIDs
+        )
+        let resolvedEmbeddingSourceID = ModelSourceCatalog.resolveEmbeddingSelection(
+            candidate: migratedEmbeddingSourceID,
+            installedSourceIDs: embeddingInstalledIDs
+        )
+
+        let chatNeedsPersistenceUpdate = persistedChatSourceID != nil && persistedChatSourceID != resolvedChatSourceID
+        let embeddingNeedsPersistenceUpdate = persistedEmbeddingSourceID != nil && persistedEmbeddingSourceID != resolvedEmbeddingSourceID
+
+        return ModelSelectionValidationResult(
+            chatSourceID: resolvedChatSourceID,
+            embeddingSourceID: resolvedEmbeddingSourceID,
+            chatNeedsPersistenceUpdate: chatNeedsPersistenceUpdate,
+            embeddingNeedsPersistenceUpdate: embeddingNeedsPersistenceUpdate
+        )
+    }
+
     private func checkExistingModels() {
         refreshSelectedStates()
     }
@@ -1053,6 +1217,31 @@ final class ModelDownloadManager {
         } catch {
             logger.warning("Existing model \(source.id) failed validation: \(error.localizedDescription)")
             updateState(for: source.id, state: .notDownloaded)
+        }
+    }
+
+    private func installedChatSourceIDsOnDisk() -> Set<ModelSourceID> {
+        installedSourceIDsOnDisk(in: ModelSourceCatalog.chatSources)
+    }
+
+    private func installedEmbeddingSourceIDsOnDisk() -> Set<ModelSourceID> {
+        installedSourceIDsOnDisk(in: ModelSourceCatalog.embeddingSources)
+    }
+
+    private func installedSourceIDsOnDisk(in sources: [ModelSource]) -> Set<ModelSourceID> {
+        Set(sources.compactMap { source in
+            isSourceInstalledOnDisk(source) ? source.id : nil
+        })
+    }
+
+    private func isSourceInstalledOnDisk(_ source: ModelSource) -> Bool {
+        let dir = modelDirectory(for: source.id)
+        guard fileManager.fileExists(atPath: dir.path) else { return false }
+        do {
+            try validateInstall(modelDir: dir, source: source)
+            return true
+        } catch {
+            return false
         }
     }
 
@@ -1186,7 +1375,16 @@ final class ModelDownloadManager {
                     throw CancellationError()
                 }
 
-                lastFailureMessage = "Download failed for \(currentURL.absoluteString): \(error.localizedDescription)"
+                switch failureKind {
+                case .transientNetwork:
+                    lastFailureMessage = "Network error while downloading model files. Check your connection and retry."
+                case .httpStatus:
+                    lastFailureMessage = "Model host returned an invalid response during download. Retry the download."
+                case .other:
+                    lastFailureMessage = "Download failed while fetching model files. Retry the download."
+                case .cancelled:
+                    lastFailureMessage = "Download was cancelled."
+                }
                 let hasFallback = currentIndex + 1 < candidateURLs.count
                 let action = retryPlanner.nextAction(for: failureKind, retryCountOnCurrentURL: retryCount, hasFallbackURL: hasFallback)
 
@@ -1372,7 +1570,62 @@ final class ModelDownloadManager {
             }
         }
 
-        return "\(defaultPrefix): \(error.localizedDescription)"
+        let failureKind = downloadFailureKind(from: error)
+        switch failureKind {
+        case .transientNetwork:
+            return "Network error while downloading model files. Check your connection and retry."
+        case .cancelled:
+            return "\(defaultPrefix): Download cancelled."
+        case .httpStatus, .other:
+            return "\(defaultPrefix): Please retry. If this continues, reinstall the model."
+        }
+    }
+
+    private func recordFailure(
+        for sourceID: ModelSourceID,
+        stage: ModelFailureStage,
+        message: String,
+        recoveryActions: [ModelRecoveryAction]
+    ) {
+        lastFailureBySourceID[sourceID] = ModelFailureReport(
+            sourceID: sourceID,
+            stage: stage,
+            message: message,
+            recoveryActions: recoveryActions,
+            timestamp: Date()
+        )
+        lastDiagnosticMessage = message
+    }
+
+    private func clearFailure(for sourceID: ModelSourceID) {
+        lastFailureBySourceID.removeValue(forKey: sourceID)
+    }
+
+    private func classifyFailureContext(for error: Error, fallbackStage: ModelFailureStage) -> (ModelFailureStage, [ModelRecoveryAction]) {
+        if let installError = error as? ModelInstallError {
+            switch installError {
+            case .insufficientSpace:
+                return (.storage, [.freeStorageSpace, .retryDownload])
+            case .tokenizerDownloadFailed, .tokenizerGated:
+                return (.tokenizer, [.reinstallModel, .openModelSettings])
+            case .validationFailed, .mlpackageInvalid, .invalidArchive, .modelNotFoundInArchive:
+                return (.validating, [.reinstallModel, .chooseAnotherModel])
+            case .preflightFailed:
+                return (.preflight, [.checkNetworkConnection, .retryDownload])
+            case .hfTreeListFailed, .fileDownloadFailed:
+                return (.downloading, [.checkNetworkConnection, .retryDownload])
+            case .notAvailableForDownload:
+                return (.preflight, [.chooseAnotherModel, .openModelSettings])
+            case .extractionFailed, .stagingCleanupFailed:
+                return (.installing, [.retryDownload, .reinstallModel])
+            }
+        }
+
+        if (error as NSError).domain == NSURLErrorDomain {
+            return (.downloading, [.checkNetworkConnection, .retryDownload])
+        }
+
+        return (fallbackStage, [.retryDownload])
     }
 
     // MARK: - Utilities

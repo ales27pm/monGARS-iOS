@@ -8,6 +8,7 @@ struct SettingsView: View {
             languageSection
             chatModelSection
             embeddingSection
+            diagnosticsSection
             networkSection
             nativePermissionsSection
             voiceSection
@@ -182,7 +183,7 @@ struct SettingsView: View {
         Section {
             HStack {
                 VStack(alignment: .leading) {
-                    Text(viewModel.modelDownloadManager.selectedEmbeddingSource?.displayName ?? "Embedding Model")
+                    Text(viewModel.modelDownloadManager.selectedEmbeddingSource?.displayName ?? viewModel.localeManager.localizedString("Embedding Model", "Mod\u{00E8}le d'embeddings"))
                         .font(.body)
                     Text(viewModel.localeManager.localizedString("Semantic Memory / Recall", "M\u{00E9}moire s\u{00E9}mantique / Rappel"))
                         .font(.caption)
@@ -237,6 +238,90 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Diagnostics
+
+    private var diagnosticsSection: some View {
+        Section {
+            if let guidance = viewModel.runtimeAvailabilityGuidance {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label(
+                        viewModel.localeManager.localizedString("Runtime Availability", "Disponibilit\u{00E9} du runtime"),
+                        systemImage: "cpu"
+                    )
+                    .font(.subheadline.bold())
+                    .foregroundStyle(.primary)
+
+                    Text(viewModel.localizedRuntimeAvailabilityMessage(guidance))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    ForEach(guidance.recoveryActions, id: \.rawValue) { action in
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: "arrow.turn.down.right")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Text(viewModel.localizedRecoveryAction(action))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if guidance.recoveryActions.contains(.retryRuntimeLoad), let coordinator = viewModel.runtimeCoordinator {
+                        Button {
+                            coordinator.requestChatReloadForSelectionChange()
+                        } label: {
+                            Label(
+                                viewModel.localeManager.localizedString("Retry Runtime Load", "R\u{00E9}essayer le chargement du runtime"),
+                                systemImage: "arrow.clockwise"
+                            )
+                        }
+                        .font(.caption)
+                        .accessibilityLabel(viewModel.localeManager.localizedString("Retry Runtime Load", "R\u{00E9}essayer le chargement du runtime"))
+                        .accessibilityHint(viewModel.localeManager.localizedString(
+                            "Reloads the selected chat model runtime now.",
+                            "Recharge maintenant le runtime du mod\u{00E8}le de conversation s\u{00E9}lectionn\u{00E9}."
+                        ))
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+
+            if let report = viewModel.chatModelLastFailure {
+                modelFailureDiagnosticsRow(
+                    title: viewModel.localeManager.localizedString("Chat Model Last Failure", "Dernier \u{00E9}chec du mod\u{00E8}le de conversation"),
+                    report: report,
+                    retryLabel: viewModel.localeManager.localizedString("Retry Chat Model Download", "R\u{00E9}essayer le t\u{00E9}l\u{00E9}chargement du mod\u{00E8}le de conversation"),
+                    sourceID: viewModel.selectedChatSourceID
+                )
+            }
+
+            if let report = viewModel.embeddingModelLastFailure {
+                modelFailureDiagnosticsRow(
+                    title: viewModel.localeManager.localizedString("Embedding Model Last Failure", "Dernier \u{00E9}chec du mod\u{00E8}le d'embeddings"),
+                    report: report,
+                    retryLabel: viewModel.localeManager.localizedString("Retry Embedding Download", "R\u{00E9}essayer le t\u{00E9}l\u{00E9}chargement des embeddings"),
+                    sourceID: viewModel.selectedEmbeddingSourceID
+                )
+            }
+
+            if !viewModel.hasDiagnostics {
+                Text(viewModel.localeManager.localizedString(
+                    "No recent model or runtime errors.",
+                    "Aucune erreur r\u{00E9}cente du mod\u{00E8}le ou du runtime."
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        } header: {
+            Text(viewModel.localeManager.localizedString("Diagnostics", "Diagnostics"))
+        } footer: {
+            Text(viewModel.localeManager.localizedString(
+                "Actionable guidance is shown here for users. Detailed technical diagnostics remain in developer logs.",
+                "Des conseils actionnables sont affich\u{00E9}s ici pour l'utilisateur. Les diagnostics techniques d\u{00E9}taill\u{00E9}s restent dans les journaux d\u{00E9}veloppeur."
+            ))
+        }
+    }
+
     // MARK: - Network
 
     private var networkSection: some View {
@@ -286,22 +371,41 @@ struct SettingsView: View {
             HStack {
                 Text(viewModel.localeManager.localizedString("Microphone", "Microphone"))
                 Spacer()
-                Text(viewModel.permissionsManager.microphoneGranted
-                     ? viewModel.localeManager.localizedString("Granted", "Accord\u{00E9}")
-                     : viewModel.localeManager.localizedString("Not Granted", "Non accord\u{00E9}"))
-                    .foregroundStyle(viewModel.permissionsManager.microphoneGranted ? .green : .secondary)
+                let micState = viewModel.permissionsManager.microphoneAuthorizationState
+                Text(voicePermissionStatusText(micState))
+                    .foregroundStyle(voicePermissionStatusColor(micState))
             }
 
             HStack {
                 Text(viewModel.localeManager.localizedString("Speech Recognition", "Reconnaissance vocale"))
                 Spacer()
-                Text(viewModel.permissionsManager.speechRecognitionGranted
-                     ? viewModel.localeManager.localizedString("Granted", "Accord\u{00E9}")
-                     : viewModel.localeManager.localizedString("Not Granted", "Non accord\u{00E9}"))
-                    .foregroundStyle(viewModel.permissionsManager.speechRecognitionGranted ? .green : .secondary)
+                let speechState = viewModel.permissionsManager.speechRecognitionAuthorizationState
+                Text(voicePermissionStatusText(speechState))
+                    .foregroundStyle(voicePermissionStatusColor(speechState))
             }
 
-            if !viewModel.permissionsManager.canUseVoice {
+            if viewModel.shouldShowVoiceSettingsRecovery {
+                Text(viewModel.localeManager.localizedString(
+                    "Voice permissions are currently denied. Open the app settings to enable microphone and speech recognition.",
+                    "Les permissions vocales sont actuellement refusées. Ouvrez les réglages de l'app pour activer le microphone et la reconnaissance vocale."
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                Button {
+                    viewModel.openAppSettings()
+                } label: {
+                    Label(
+                        viewModel.localeManager.localizedString("Open App Settings", "Ouvrir les réglages de l'app"),
+                        systemImage: "arrow.up.forward.app"
+                    )
+                }
+                .accessibilityLabel(viewModel.localeManager.localizedString("Open App Settings", "Ouvrir les réglages de l'app"))
+                .accessibilityHint(viewModel.localeManager.localizedString(
+                    "Opens iOS Settings for this app so you can enable microphone and speech recognition.",
+                    "Ouvre les r\u{00E9}glages iOS de cette app pour activer le microphone et la reconnaissance vocale."
+                ))
+            } else if !viewModel.permissionsManager.canUseVoice {
                 Button {
                     Task { await viewModel.requestVoicePermissions() }
                 } label: {
@@ -310,6 +414,11 @@ struct SettingsView: View {
                         systemImage: "mic.badge.plus"
                     )
                 }
+                .accessibilityLabel(viewModel.localeManager.localizedString("Grant Voice Permissions", "Accorder les permissions vocales"))
+                .accessibilityHint(viewModel.localeManager.localizedString(
+                    "Requests microphone and speech recognition permissions if they were not requested yet.",
+                    "Demande les permissions du microphone et de la reconnaissance vocale si elles n'ont pas encore \u{00E9}t\u{00E9} demand\u{00E9}es."
+                ))
             }
         } header: {
             Text(viewModel.localeManager.localizedString("Voice", "Voix"))
@@ -336,6 +445,11 @@ struct SettingsView: View {
                         systemImage: "checkmark.shield"
                     )
                 }
+                .accessibilityLabel(viewModel.localeManager.localizedString("Grant All Native Permissions", "Accorder toutes les permissions natives"))
+                .accessibilityHint(viewModel.localeManager.localizedString(
+                    "Requests access to all native features used by MonGARS.",
+                    "Demande l'acc\u{00E8}s \u{00E0} toutes les fonctionnalit\u{00E9}s natives utilis\u{00E9}es par MonGARS."
+                ))
             }
         } header: {
             Text(viewModel.localeManager.localizedString("Native Features", "Fonctionnalités natives"))
@@ -455,9 +569,92 @@ struct SettingsView: View {
             Text(title)
             Spacer()
             Text(granted
-                 ? viewModel.localeManager.localizedString("Granted", "Accordé")
-                 : viewModel.localeManager.localizedString("Not Granted", "Non accordé"))
+                ? viewModel.localeManager.localizedString("Granted", "Accordé")
+                : viewModel.localeManager.localizedString("Not Granted", "Non accordé"))
                 .foregroundStyle(granted ? .green : .secondary)
         }
+    }
+
+    private func voicePermissionStatusText(_ state: PermissionsManager.VoiceAuthorizationState) -> String {
+        switch state {
+        case .granted:
+            return viewModel.localeManager.localizedString("Granted", "Accordé")
+        case .notDetermined:
+            return viewModel.localeManager.localizedString("Not Requested", "Non demandé")
+        case .denied:
+            return viewModel.localeManager.localizedString("Denied", "Refusé")
+        case .restricted:
+            return viewModel.localeManager.localizedString("Restricted", "Restreint")
+        }
+    }
+
+    private func voicePermissionStatusColor(_ state: PermissionsManager.VoiceAuthorizationState) -> Color {
+        switch state {
+        case .granted:
+            return .green
+        case .denied, .restricted:
+            return .red
+        case .notDetermined:
+            return .secondary
+        }
+    }
+
+    private func modelFailureDiagnosticsRow(
+        title: String,
+        report: ModelFailureReport,
+        retryLabel: String,
+        sourceID: ModelSourceID
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(title, systemImage: "exclamationmark.triangle.fill")
+                .font(.subheadline.bold())
+                .foregroundStyle(.orange)
+
+            HStack(spacing: 8) {
+                Text(viewModel.localeManager.localizedString("Stage", "Étape"))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(viewModel.localizedFailureStage(report.stage))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text("•")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(viewModel.localizedTimestamp(report.timestamp))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(report.message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            ForEach(report.recoveryActions, id: \.rawValue) { action in
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "arrow.turn.down.right")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text(viewModel.localizedRecoveryAction(action))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if !viewModel.modelDownloadManager.stateForSource(sourceID).isDownloading &&
+                !viewModel.modelDownloadManager.stateForSource(sourceID).isInstalling {
+                Button {
+                    viewModel.downloadModel(sourceID)
+                } label: {
+                    Label(retryLabel, systemImage: "arrow.clockwise")
+                }
+                .font(.caption)
+                .accessibilityLabel(retryLabel)
+                .accessibilityHint(viewModel.localeManager.localizedString(
+                    "Retries this model download using the current selection.",
+                    "Relance le t\u{00E9}l\u{00E9}chargement de ce mod\u{00E8}le avec la s\u{00E9}lection actuelle."
+                ))
+            }
+        }
+        .padding(.vertical, 4)
     }
 }

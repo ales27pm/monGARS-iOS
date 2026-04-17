@@ -7,7 +7,9 @@
 
 import Testing
 @testable import MonGARS
+import AVFoundation
 import Foundation
+import Speech
 
 struct MonGARSTests {
     @Test func retryPlannerRetriesTransientFailuresWithExponentialBackoff() {
@@ -36,6 +38,21 @@ struct MonGARSTests {
         #expect(on403WithFallback == .switchToFallbackURL)
     }
 
+    @Test func retryPlannerHandlesRetryableHTTPStatusesAndCancellationDeterministically() {
+        let planner = DownloadRetryPlanner(maxRetriesPerURL: 2, baseDelaySeconds: 1, maxDelaySeconds: 8)
+
+        let first500 = planner.nextAction(for: .httpStatus(500), retryCountOnCurrentURL: 0, hasFallbackURL: false)
+        let second429 = planner.nextAction(for: .httpStatus(429), retryCountOnCurrentURL: 1, hasFallbackURL: false)
+        let exhausted500 = planner.nextAction(for: .httpStatus(500), retryCountOnCurrentURL: 2, hasFallbackURL: false)
+        let cancelled = planner.nextAction(for: .cancelled, retryCountOnCurrentURL: 0, hasFallbackURL: true)
+
+        #expect(first500 == .retry(delaySeconds: 1))
+        #expect(second429 == .retry(delaySeconds: 2))
+        #expect(exhausted500 == .fail)
+        #expect(cancelled == .fail)
+        #expect(DownloadURLSelector.nextIndex(after: .fail, currentIndex: 0, totalURLCount: 2) == nil)
+    }
+
     @Test func fallbackURLSelectionIsDeterministic() {
         #expect(DownloadURLSelector.nextIndex(after: .switchToFallbackURL, currentIndex: 0, totalURLCount: 3) == 1)
         #expect(DownloadURLSelector.nextIndex(after: .switchToFallbackURL, currentIndex: 2, totalURLCount: 3) == nil)
@@ -62,6 +79,130 @@ struct MonGARSTests {
 
         state = ModelDownloadStateReducer.reduce(state, event: .cancelled)
         #expect(state == .notDownloaded)
+    }
+
+    @MainActor
+    @Test func deletingSelectedChatModelResetsSelectionToFallback() {
+        let manager = ModelDownloadManager()
+        let deletedSourceID = ModelSourceCatalog.defaultChatSourceID
+
+        manager.selectedChatSourceID = deletedSourceID
+        manager.refreshSelectedStates()
+        manager.deleteModel(sourceID: deletedSourceID)
+
+        #expect(manager.selectedChatSourceID != deletedSourceID)
+        #expect(ModelSourceCatalog.chatSource(for: manager.selectedChatSourceID) != nil)
+    }
+
+    @MainActor
+    @Test func deletingSelectedEmbeddingModelResetsSelectionToValidFallback() {
+        let manager = ModelDownloadManager()
+        let deletedSourceID = ModelSourceCatalog.defaultEmbeddingSourceID
+
+        manager.selectedEmbeddingSourceID = deletedSourceID
+        manager.refreshSelectedStates()
+        manager.deleteModel(sourceID: deletedSourceID)
+
+        #expect(manager.selectedEmbeddingSourceID != deletedSourceID)
+        #expect(ModelSourceCatalog.embeddingSource(for: manager.selectedEmbeddingSourceID) != nil)
+    }
+
+    @MainActor
+    @Test func launchValidationCorrectsPersistedSelectionThatIsMissingOnDisk() {
+        let manager = ModelDownloadManager()
+        let result = manager.validateSelectionOnLaunch(
+            persistedChatSourceID: "qwen2.5-3b-4bit",
+            persistedEmbeddingSourceID: ModelSourceCatalog.defaultEmbeddingSourceID,
+            installedChatSourceIDs: [ModelSourceCatalog.fallbackChatSourceID],
+            installedEmbeddingSourceIDs: [ModelSourceCatalog.defaultEmbeddingSourceID]
+        )
+
+        #expect(result.chatSourceID == ModelSourceCatalog.fallbackChatSourceID)
+        #expect(result.chatNeedsPersistenceUpdate)
+        #expect(result.embeddingSourceID == ModelSourceCatalog.defaultEmbeddingSourceID)
+        #expect(result.embeddingNeedsPersistenceUpdate == false)
+    }
+
+    @MainActor
+    @Test func obsoletePersistedModelIDsMigrateToSupportedSources() {
+        let manager = ModelDownloadManager()
+        let result = manager.validateSelectionOnLaunch(
+            persistedChatSourceID: "llama-3.2-3b-instruct",
+            persistedEmbeddingSourceID: "granite-embedding-278m",
+            installedChatSourceIDs: [ModelSourceCatalog.defaultChatSourceID],
+            installedEmbeddingSourceIDs: [ModelSourceCatalog.defaultEmbeddingSourceID]
+        )
+
+        #expect(result.chatSourceID == ModelSourceCatalog.defaultChatSourceID)
+        #expect(result.embeddingSourceID == ModelSourceCatalog.defaultEmbeddingSourceID)
+        #expect(result.chatNeedsPersistenceUpdate)
+        #expect(result.embeddingNeedsPersistenceUpdate)
+    }
+
+    @MainActor
+    @Test func modelDownloadManagerTracksAndClearsStructuredLastFailure() {
+        let manager = ModelDownloadManager()
+        let invalidSourceID = "invalid-source-id"
+
+        manager.startDownload(sourceID: invalidSourceID)
+        let failure = manager.lastFailureReport(for: invalidSourceID)
+
+        #expect(failure != nil)
+        #expect(failure?.stage == .preflight)
+        #expect(failure?.recoveryActions.contains(.openModelSettings) == true)
+        #expect(failure?.recoveryActions.contains(.chooseAnotherModel) == true)
+
+        manager.cancelDownload(sourceID: invalidSourceID)
+        #expect(manager.lastFailureReport(for: invalidSourceID) == nil)
+    }
+
+    @Test func downloadDiagnosticErrorsExposeActionableRecovery() {
+        let accessDenied = DownloadDiagnosticError.accessDenied(url: "https://example.com", statusCode: 403)
+        #expect(accessDenied.recoveryActions == [.acceptModelLicense, .retryDownload])
+
+        let rateLimited = DownloadDiagnosticError.rateLimited(url: "https://example.com")
+        #expect(rateLimited.recoveryActions == [.waitAndRetry, .retryDownload])
+
+        let noURL = DownloadDiagnosticError.noDownloadURL(sourceID: "chat")
+        #expect(noURL.recoveryActions == [.chooseAnotherModel, .openModelSettings])
+    }
+
+    @Test func runtimeGuidanceMapsAvailabilityIssuesToRecoveryActions() {
+        let notInstalled = ModelRuntimeCoordinator.guidance(for: .notInstalled)
+        #expect(notInstalled?.recoveryActions == [.openModelSettings, .retryDownload])
+
+        let tokenizerInvalid = ModelRuntimeCoordinator.guidance(for: .runtimeLoadFailed(.tokenizerInvalid))
+        #expect(tokenizerInvalid?.recoveryActions.contains(.reinstallModel) == true)
+        #expect(tokenizerInvalid?.recoveryActions.contains(.openModelSettings) == true)
+
+        let oom = ModelRuntimeCoordinator.guidance(for: .runtimeLoadFailed(.outOfMemory))
+        #expect(oom?.recoveryActions == [.closeOtherApps, .retryRuntimeLoad])
+    }
+
+    @Test func permissionsManagerMapsSpeechAuthorizationStatuses() {
+        #expect(PermissionsManager.voiceAuthorizationState(forSpeechAuthorizationStatus: .authorized) == .granted)
+        #expect(PermissionsManager.voiceAuthorizationState(forSpeechAuthorizationStatus: .notDetermined) == .notDetermined)
+        #expect(PermissionsManager.voiceAuthorizationState(forSpeechAuthorizationStatus: .denied) == .denied)
+        #expect(PermissionsManager.voiceAuthorizationState(forSpeechAuthorizationStatus: .restricted) == .restricted)
+    }
+
+    @Test func permissionsManagerMapsMicrophoneAuthorizationStatuses() {
+        #expect(PermissionsManager.voiceAuthorizationState(forMicrophonePermission: AVAudioSession.RecordPermission.granted) == .granted)
+        #expect(PermissionsManager.voiceAuthorizationState(forMicrophonePermission: AVAudioSession.RecordPermission.undetermined) == .notDetermined)
+        #expect(PermissionsManager.voiceAuthorizationState(forMicrophonePermission: AVAudioSession.RecordPermission.denied) == .denied)
+    }
+
+    @Test func permissionsManagerSettingsRecoveryDecisionUsesDeniedStates() {
+        #expect(PermissionsManager.shouldOfferVoiceSettingsRecovery(microphoneState: .denied, speechState: .granted))
+        #expect(PermissionsManager.shouldOfferVoiceSettingsRecovery(microphoneState: .granted, speechState: .restricted))
+        #expect(PermissionsManager.shouldOfferVoiceSettingsRecovery(microphoneState: .notDetermined, speechState: .granted) == false)
+    }
+
+    @MainActor
+    @Test func permissionsManagerMarksAppActiveRefreshTrigger() {
+        let manager = PermissionsManager()
+        manager.refreshAfterAppBecomesActive()
+        #expect(manager.lastRefreshTrigger == .appDidBecomeActive)
     }
 
     @Test func llmEngineStatefulDetectionUsesAnyModelStateDescription() {
@@ -101,6 +242,32 @@ struct MonGARSTests {
         #expect(plan.didTruncate)
         #expect(plan.tokensForPrediction == [33])
         #expect(plan.requiresStateReset)
+    }
+
+    @Test func llmEngineBoundedTokenHistoryKeepsMostRecentTokens() {
+        var history = LLMEngine.BoundedTokenHistory(capacity: 4, initialTokens: [1, 2, 3, 4, 5])
+
+        #expect(history.asArray() == [2, 3, 4, 5])
+        #expect(history.count == 4)
+
+        let didEvict = history.append(6)
+        #expect(didEvict)
+        #expect(history.asArray() == [3, 4, 5, 6])
+        #expect(history.suffixArray(2) == [5, 6])
+    }
+
+    @Test func llmEngineRepetitionPenaltyWindowUsesRecentTokensOnly() {
+        let tokens = Array(0..<100)
+        let unique = LLMEngine.uniqueRecentTokensForRepetitionPenalty(tokens: tokens, windowSize: 8)
+
+        #expect(unique == Set(92..<100))
+    }
+
+    @Test func llmEngineBoundedTokenHistoryRecentWindowDeduplicatesTokens() {
+        let history = LLMEngine.BoundedTokenHistory(capacity: 16, initialTokens: [4, 4, 5, 6, 6, 7, 8])
+        let unique = history.uniqueTokensInRecentWindow(windowSize: 4)
+
+        #expect(unique == Set([6, 7, 8]))
     }
 
     @Test func toolCallParserExtractsValidToolCall() throws {
@@ -158,6 +325,41 @@ struct MonGARSTests {
             Issue.record("Expected unknown tool error, but parse succeeded.")
         } catch let error as ToolCallParsingError {
             #expect(error == .unknownTool("nonexistent_tool"))
+        } catch {
+            Issue.record("Unexpected error type: \(error)")
+        }
+    }
+
+    @Test func toolCallParserRejectsArgumentsWhenTheyAreNotAJSONObject() {
+        let response = #"<tool_call>{"name":"create_reminder","arguments":"not-an-object"}</tool_call>"#
+
+        do {
+            _ = try ToolCallParser.parseToolCall(from: response, schemas: parserTestSchemas())
+            Issue.record("Expected non-object arguments error, but parse succeeded.")
+        } catch let error as ToolCallParsingError {
+            #expect(error == .argumentsMustBeObject)
+        } catch {
+            Issue.record("Unexpected error type: \(error)")
+        }
+    }
+
+    @Test func toolCallParserSchemaValidationCoercesSupportedScalarTypes() throws {
+        let response = #"<tool_call>{"name":"set_timer","arguments":{"seconds":"15","enabled":1}}</tool_call>"#
+        let parsed = try ToolCallParser.parseToolCall(from: response, schemas: parserTypedSchemas())
+
+        #expect(parsed?.toolName == "set_timer")
+        #expect(parsed?.arguments["seconds"] == "15")
+        #expect(parsed?.arguments["enabled"] == "true")
+    }
+
+    @Test func toolCallParserSchemaValidationRejectsInvalidTypedArguments() {
+        let response = #"<tool_call>{"name":"set_timer","arguments":{"seconds":"fifteen","enabled":"yes"}}</tool_call>"#
+
+        do {
+            _ = try ToolCallParser.parseToolCall(from: response, schemas: parserTypedSchemas())
+            Issue.record("Expected invalid argument type error, but parse succeeded.")
+        } catch let error as ToolCallParsingError {
+            #expect(error == .invalidArgumentType(argument: "seconds", expected: .integer))
         } catch {
             Issue.record("Unexpected error type: \(error)")
         }
@@ -330,6 +532,34 @@ struct MonGARSTests {
         #expect(await tokenizer.eosTokenId == 410_001)
     }
 
+    @Test func tokenizerResolvesSpecialTokenIDsFromSpecialTokensMap() async throws {
+        let fixtureURL = try makeTokenizerFixtureDirectory(
+            vocab: makeByteLevelVocab(),
+            addedTokens: [
+                (token: "<|begin_of_text|>", id: 420_000),
+                (token: "<|eot_id|>", id: 420_001),
+                (token: "<|custom_special|>", id: 420_002)
+            ],
+            config: [
+                "model_max_length": 4096
+            ],
+            specialTokensMap: [
+                "bos_token": ["content": "<|begin_of_text|>"],
+                "eos_token": ["token": "<|eot_id|>"],
+                "additional_special_tokens": [
+                    ["id": 420_002, "content": "<|custom_special|>"]
+                ]
+            ]
+        )
+        defer { try? FileManager.default.removeItem(at: fixtureURL) }
+
+        let tokenizer = TokenizerService()
+        try await tokenizer.load(from: fixtureURL)
+
+        #expect(await tokenizer.bosTokenId == 420_000)
+        #expect(await tokenizer.eosTokenId == 420_001)
+    }
+
     @Test func tokenizerRejectsStructurallyValidButSemanticallyBrokenData() async throws {
         let fixtureURL = try makeTokenizerFixtureDirectory(
             vocab: ["x": 0],
@@ -482,6 +712,20 @@ struct MonGARSTests {
                 parameters: [
                     ToolParameter(name: "query", description: "Search query", type: .string, required: true),
                     ToolParameter(name: "language", description: "Language code", type: .string, required: false),
+                ],
+                requiresApproval: true
+            )
+        ]
+    }
+
+    private func parserTypedSchemas() -> [ToolSchema] {
+        [
+            ToolSchema(
+                name: "set_timer",
+                description: "Sets a timer",
+                parameters: [
+                    ToolParameter(name: "seconds", description: "Timer duration in seconds", type: .integer, required: true),
+                    ToolParameter(name: "enabled", description: "Whether the timer is enabled", type: .boolean, required: true),
                 ],
                 requiresApproval: true
             )
